@@ -12,6 +12,10 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    // Version comes from build.zig.zon so release tags have a single source.
+    const build_options = b.addOptions();
+    build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
+    exe.root_module.addOptions("build_options", build_options);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

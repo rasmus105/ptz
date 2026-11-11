@@ -1,10 +1,27 @@
+// std
 const std = @import("std");
 
-pub fn main(init: std.process.Init) !void {
-    var stdout_buffer: [256]u8 = undefined;
-    var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
-    const stdout = &stdout_file_writer.interface;
+// local
+const cli = @import("cli.zig");
 
-    try stdout.writeAll("Hello, world!\n");
+// ====================================================================================================
+// Public API
+// ====================================================================================================
+
+pub fn main(init: std.process.Init) !void {
+    const options = try cli.parse(init);
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
+    const stdout = &stdout_writer.interface;
+    try stdout.print("open {s} at page {d} using {t}\n", .{ options.file, options.page, options.protocol });
     try stdout.flush();
+}
+
+// ====================================================================================================
+// Tests
+// ====================================================================================================
+
+test {
+    _ = @import("argparse.zig");
 }
