@@ -33,10 +33,11 @@ pub const Key = union(enum) {
         len: u32,
     };
 
-    /// Decodes the first key in `bytes`, which must not be empty. Terminals
-    /// write a key's whole sequence at once, so a lone ESC at the end of
-    /// `bytes` is the Escape key rather than the start of a sequence.
-    pub fn decode(bytes: []const u8) Decoded {
+    /// Decodes the first key in `bytes`, which must not be empty, or returns
+    /// null if `bytes` ends inside a sequence; decode again once more bytes
+    /// have arrived. Terminals write a key's whole sequence at once, so a
+    /// lone ESC is the Escape key rather than the start of a sequence.
+    pub fn decode(bytes: []const u8) ?Decoded {
         std.debug.assert(bytes.len > 0);
         const byte = bytes[0];
         switch (byte) {
@@ -49,23 +50,26 @@ pub const Key = union(enum) {
             else => {},
         }
         const len = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .key = .unknown, .len = 1 };
-        if (len > bytes.len) return .{ .key = .unknown, .len = @intCast(bytes.len) };
+        if (len > bytes.len) return null;
         const char = std.unicode.utf8Decode(bytes[0..len]) catch return .{ .key = .unknown, .len = len };
         return .{ .key = .{ .char = char }, .len = len };
     }
 
-    fn decodeEscape(bytes: []const u8) Decoded {
+    fn decodeEscape(bytes: []const u8) ?Decoded {
         std.debug.assert(bytes[0] == 0x1b);
         if (bytes.len == 1) return .{ .key = .escape, .len = 1 };
         // SS3 sequences (`ESC O A`) are what arrow keys send in application mode.
-        if (bytes[1] == 'O' and bytes.len >= 3) return .{ .key = finalKey(bytes[2], 0), .len = 3 };
+        if (bytes[1] == 'O') {
+            if (bytes.len < 3) return null;
+            return .{ .key = finalKey(bytes[2], 0), .len = 3 };
+        }
         if (bytes[1] != '[') return .{ .key = .escape, .len = 1 };
 
         // CSI: parameters and intermediates, then a final byte in 0x40...0x7e.
         var end: u32 = 2;
         while (end < bytes.len) : (end += 1) {
             if (bytes[end] >= 0x40 and bytes[end] <= 0x7e) break;
-        } else return .{ .key = .unknown, .len = @intCast(bytes.len) };
+        } else return null;
         const params = bytes[2..end];
         const first = std.fmt.parseInt(u8, params[0 .. std.mem.indexOfScalar(u8, params, ';') orelse params.len], 10) catch 0;
         return .{ .key = finalKey(bytes[end], first), .len = end + 1 };
@@ -99,7 +103,7 @@ pub const Key = union(enum) {
 fn expectKeys(input: []const u8, expected: []const Key) !void {
     var rest = input;
     for (expected) |key| {
-        const decoded = Key.decode(rest);
+        const decoded = Key.decode(rest).?;
         try std.testing.expectEqual(key, decoded.key);
         rest = rest[decoded.len..];
     }
@@ -124,5 +128,11 @@ test "lone escape and unrecognized sequences" {
     try expectKeys("\x1bx", &.{ .escape, .{ .char = 'x' } });
     // A query reply and an F-key are skipped as single units.
     try expectKeys("\x1b[?62;22c\x1b[15~q", &.{ .unknown, .unknown, .{ .char = 'q' } });
-    try expectKeys("\x1b[1;2", &.{.unknown});
+}
+
+test "a sequence cut off at the end waits for the rest" {
+    try std.testing.expectEqual(null, Key.decode("\x1b[1;5"));
+    try std.testing.expectEqual(null, Key.decode("\x1bO"));
+    try std.testing.expectEqual(null, Key.decode("\xc3"));
+    try expectKeys("\x1b[1;5C", &.{.right});
 }

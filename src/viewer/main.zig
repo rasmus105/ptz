@@ -18,7 +18,7 @@ const terminal = @import("../terminal/main.zig");
 
 // local
 const keymap = @import("keymap.zig");
-const layout_ = @import("layout.zig");
+const tiling = @import("tiling.zig");
 
 // ====================================================================================================
 // Constants
@@ -32,24 +32,34 @@ const zoom_max = 8;
 const line_rows = 2;
 const command_len_max = 128;
 const message_len_max = 160;
+const slices_max = 64;
+const status_len_max = 512;
 
 // ====================================================================================================
 // Types
 // ====================================================================================================
 
-pub const Action = keymap.Action;
-pub const Frame = layout_.Frame;
-pub const Tile = layout_.Tile;
-pub const Slice = layout_.Slice;
-pub const Anchor = layout_.Anchor;
-pub const wanted_max = layout_.wanted_max;
+pub const Tile = tiling.Tile;
+pub const Slice = tiling.Slice;
+pub const Anchor = tiling.Anchor;
+pub const wanted_max = 64;
+
+/// A loaded version of the document.
+pub const Document = struct {
+    /// Identifies this load; tiles carry it so that tiles of another load
+    /// are never mistaken for current ones.
+    generation: u32,
+    page_sizes: []const pdf.Size,
+    /// Scratch space for the layout, one element per page.
+    tops: []i64,
+};
 
 pub const Event = union(enum) {
     key: terminal.Key,
     resize: terminal.Size,
-    /// A document was (re)loaded. The page sizes must stay valid until the
-    /// next `document` event. The position is kept, clamped to the document.
-    document: []const pdf.Size,
+    /// A document was (re)loaded. Its slices must stay valid until the next
+    /// `document` event. The position is kept, clamped to the document.
+    document: Document,
     /// Something to tell the user, e.g. that a reload failed.
     message: []const u8,
 };
@@ -57,14 +67,53 @@ pub const Event = union(enum) {
 /// What the shell should do after an event.
 pub const Effect = enum { none, quit, reload };
 
+/// The status line: `left` is truncated to make room for `right`.
+pub const Status = struct {
+    left: []const u8,
+    right: []const u8,
+    /// Truncate `left` at its start instead of its end, e.g. to show where
+    /// typing happens on the command line.
+    keep_end: bool,
+};
+
+/// What to draw: the visible parts of tiles, the tiles to have ready, and
+/// the status line.
+pub const Frame = struct {
+    slices_buffer: [slices_max]Slice,
+    slices_len: u32,
+    /// Most urgent first: the visible tiles, then those of the next screen
+    /// down, then of the screen above.
+    wanted_buffer: [wanted_max]Tile,
+    wanted_len: u32,
+    status_buffer: [status_len_max]u8,
+    status_left_len: u32,
+    status_right_len: u32,
+    status_keep_end: bool,
+
+    pub fn slices(frame: *const Frame) []const Slice {
+        return frame.slices_buffer[0..frame.slices_len];
+    }
+
+    pub fn wanted(frame: *const Frame) []const Tile {
+        return frame.wanted_buffer[0..frame.wanted_len];
+    }
+
+    pub fn status(frame: *const Frame) Status {
+        const left = frame.status_buffer[0..frame.status_left_len];
+        return .{
+            .left = left,
+            .right = frame.status_buffer[left.len..][0..frame.status_right_len],
+            .keep_end = frame.status_keep_end,
+        };
+    }
+};
+
 pub const State = struct {
     file_name: []const u8,
     size: terminal.Size,
-    /// Empty until the document is loaded.
-    page_sizes: []const pdf.Size,
-    /// Incremented on every `document` event, so tiles of an older version
-    /// of the document are never mistaken for current ones.
-    generation: u32,
+    document: Document,
+    /// Derived from the document, size and zoom; see `relayout`.
+    geometry: tiling.Geometry,
     anchor: Anchor,
     /// Horizontal scroll in pixels when the pages are wider than the window.
     pan_x: u32,
@@ -79,13 +128,14 @@ pub const State = struct {
     message_buffer: [message_len_max]u8,
     message_len: u32,
 
-    pub fn init(file_name: []const u8, size: terminal.Size, dark: bool) State {
-        return .{
+    /// Starts at `page`, counting from 1, once the document is loaded.
+    pub fn init(file_name: []const u8, size: terminal.Size, dark: bool, page: u32) State {
+        var state: State = .{
             .file_name = file_name,
             .size = size,
-            .page_sizes = &.{},
-            .generation = 0,
-            .anchor = .{ .page = 0, .y = 0 },
+            .document = .{ .generation = 0, .page_sizes = &.{}, .tops = &.{} },
+            .geometry = undefined,
+            .anchor = .{ .page = page -| 1, .y = 0 },
             .pan_x = 0,
             .zoom = 1,
             .dark = dark,
@@ -96,6 +146,8 @@ pub const State = struct {
             .message_buffer = undefined,
             .message_len = 0,
         };
+        state.relayout();
+        return state;
     }
 
     pub fn update(state: *State, event: Event) Effect {
@@ -108,12 +160,13 @@ pub const State = struct {
             },
             .resize => |size| {
                 state.size = size;
-                state.clamp();
+                state.relayout();
             },
-            .document => |page_sizes| {
-                state.page_sizes = page_sizes;
-                state.generation += 1;
-                state.clamp();
+            .document => |document| {
+                std.debug.assert(document.tops.len == document.page_sizes.len);
+                std.debug.assert(document.generation > state.document.generation);
+                state.document = document;
+                state.relayout();
             },
             .message => |text| {
                 state.message_len = @intCast(@min(text.len, message_len_max));
@@ -123,13 +176,24 @@ pub const State = struct {
         return .none;
     }
 
-    pub fn apply(state: *State, action: Action) Effect {
-        const geometry = state.computeGeometry();
+    pub fn layout(state: *const State, frame: *Frame) void {
+        tiling.layout(state.geometry, state.anchor, state.pan_x, .{
+            .generation = state.document.generation,
+            .dark = state.dark,
+        }, frame);
+        state.writeStatus(frame);
+    }
+
+    fn apply(state: *State, action: keymap.Action) Effect {
+        const view_height: i64 = state.geometry.view_height;
         switch (action) {
             .scroll_lines => |n| state.scrollBy(@as(i64, n) * line_rows * state.size.cell_height),
-            .scroll_half_screens => |n| state.scrollBy(@divTrunc(@as(i64, n) * geometry.view_height, 2)),
-            .scroll_screens => |n| state.scrollBy(@as(i64, n) * geometry.view_height),
-            .pan_lines => |n| state.panBy(@as(i64, n) * line_rows * state.size.cell_width),
+            .scroll_half_screens => |n| state.scrollBy(@divTrunc(n * view_height, 2)),
+            .scroll_screens => |n| state.scrollBy(n * view_height),
+            .pan_lines => |n| {
+                const pan = @as(i64, state.pan_x) + @as(i64, n) * line_rows * state.size.cell_width;
+                state.pan_x = @intCast(std.math.clamp(pan, 0, state.geometry.panMax()));
+            },
             .move_pages => |n| state.gotoPage(@as(i64, state.anchor.page) + n),
             .goto_page => |page| state.gotoPage(@as(i64, page) - 1),
             .goto_last_page => state.gotoPage(std.math.maxInt(i32)),
@@ -145,59 +209,38 @@ pub const State = struct {
         return .none;
     }
 
-    pub fn layout(state: *const State, frame: *Frame) void {
-        layout_.layout(state.computeGeometry(), state.anchor, state.pan_x, .{
-            .generation = state.generation,
-            .dark = state.dark,
-        }, frame);
-        state.writeStatus(frame);
-    }
-
-    fn computeGeometry(state: *const State) layout_.Geometry {
-        return .init(state.page_sizes, state.size, state.zoom);
-    }
-
     fn scrollBy(state: *State, delta: i64) void {
-        const geometry = state.computeGeometry();
-        state.anchor = geometry.anchorAt(geometry.offsetOf(state.anchor) + delta);
-    }
-
-    fn panBy(state: *State, delta: i64) void {
-        const pan_max = state.computeGeometry().panMax();
-        state.pan_x = @intCast(std.math.clamp(@as(i64, state.pan_x) + delta, 0, pan_max));
+        if (state.document.page_sizes.len == 0) return;
+        state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(state.anchor) + delta);
     }
 
     fn gotoPage(state: *State, page: i64) void {
-        if (state.page_sizes.len == 0) return;
-        const last: i64 = @intCast(state.page_sizes.len - 1);
-        const geometry = state.computeGeometry();
-        const anchor: Anchor = .{ .page = @intCast(std.math.clamp(page, 0, last)), .y = 0 };
-        state.anchor = geometry.anchorAt(geometry.offsetOf(anchor));
+        const pages = state.document.page_sizes.len;
+        if (pages == 0) return;
+        const anchor: Anchor = .{ .page = @intCast(std.math.clamp(page, 0, @as(i64, @intCast(pages - 1)))), .y = 0 };
+        state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(anchor));
     }
 
     fn setZoom(state: *State, zoom: f32) void {
-        const old_scale = state.computeGeometry().scale;
+        const old_scale = state.geometry.scale;
         state.zoom = std.math.clamp(zoom, zoom_min, zoom_max);
-        const geometry = state.computeGeometry();
-        if (state.page_sizes.len == 0) return;
+        state.relayout();
         // Keep the horizontal centre of the view where it was.
-        const half_width = @as(f32, @floatFromInt(geometry.view_width)) / 2;
-        const centre = @as(f32, @floatFromInt(state.pan_x)) + half_width;
-        const pan = centre * geometry.scale / old_scale - half_width;
-        state.pan_x = @intFromFloat(std.math.clamp(pan, 0, @as(f32, @floatFromInt(geometry.panMax()))));
-        state.clamp();
+        const half_width = @as(f32, @floatFromInt(state.geometry.view_width)) / 2;
+        const centre = (@as(f32, @floatFromInt(state.pan_x)) + half_width) * state.geometry.scale / old_scale;
+        const pan_max: f32 = @floatFromInt(state.geometry.panMax());
+        state.pan_x = @intFromFloat(std.math.clamp(centre - half_width, 0, pan_max));
     }
 
-    /// Keeps the anchor and pan inside the document after it or the window
-    /// changed.
-    fn clamp(state: *State) void {
-        if (state.page_sizes.len == 0) return;
-        const geometry = state.computeGeometry();
-        if (state.anchor.page >= state.page_sizes.len) {
-            state.anchor = .{ .page = @intCast(state.page_sizes.len - 1), .y = 0 };
-        }
-        state.anchor = geometry.anchorAt(geometry.offsetOf(state.anchor));
-        state.pan_x = @min(state.pan_x, geometry.panMax());
+    /// Recomputes the geometry after the document, size or zoom changed, and
+    /// keeps the position inside the document.
+    fn relayout(state: *State) void {
+        state.geometry = .init(state.document.page_sizes, state.document.tops, state.size, state.zoom);
+        const pages = state.document.page_sizes.len;
+        if (pages == 0) return;
+        if (state.anchor.page >= pages) state.anchor = .{ .page = @intCast(pages - 1), .y = 0 };
+        state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(state.anchor));
+        state.pan_x = @min(state.pan_x, state.geometry.panMax());
     }
 
     fn editCommand(state: *State, key: terminal.Key) Effect {
@@ -237,48 +280,57 @@ pub const State = struct {
         var words = std.mem.tokenizeScalar(u8, line, ' ');
         const name = words.next() orelse return .none;
         const argument = words.next();
-        if (std.fmt.parseInt(u32, name, 10)) |page| return state.apply(.{ .goto_page = page }) else |_| {}
-        if (eql(name, "q") or eql(name, "quit")) return .quit;
-        if (eql(name, "reload")) return .reload;
-        if (eql(name, "dark")) return state.apply(.toggle_dark);
-        if (eql(name, "zoom")) {
-            const percent = std.fmt.parseFloat(f32, argument orelse "") catch
-                return state.update(.{ .message = "usage: zoom <percent>" });
+        const extra = words.next() != null;
+        if (std.mem.indexOfNone(u8, name, "0123456789") == null) {
+            // Too many digits just means the last page, as with `G`.
+            const page = std.fmt.parseInt(u32, name, 10) catch std.math.maxInt(u32);
+            return state.apply(.{ .goto_page = page });
+        }
+        if (std.mem.eql(u8, name, "q") or std.mem.eql(u8, name, "quit")) return .quit;
+        if (std.mem.eql(u8, name, "reload")) return .reload;
+        if (std.mem.eql(u8, name, "dark")) return state.apply(.toggle_dark);
+        if (std.mem.eql(u8, name, "zoom")) {
+            // Plain decimals only: parseFloat also takes `nan` and hex.
+            const text = argument orelse "";
+            const valid = !extra and text.len > 0 and std.mem.indexOfNone(u8, text, "0123456789.") == null;
+            const percent = if (valid) std.fmt.parseFloat(f32, text) catch 0 else 0;
+            if (percent <= 0) return state.update(.{ .message = "usage: zoom <percent>" });
             state.setZoom(percent / 100);
             return .none;
         }
         return state.update(.{ .message = "unknown command" });
     }
 
-    /// The last row: the command line while it is open, otherwise the file
-    /// name and position, with any message in place of the file name.
+    /// The last row: the command line while it is open, otherwise any
+    /// message or else the file name, with the position on the right.
     fn writeStatus(state: *const State, frame: *Frame) void {
         var writer: std.Io.Writer = .fixed(&frame.status_buffer);
+        frame.status_keep_end = state.command_open;
         if (state.command_open) {
             writer.print(":{s}", .{state.command_buffer[0..state.command_len]}) catch {};
-        } else if (state.page_sizes.len == 0) {
-            writer.print("{s}  loading...", .{state.file_name}) catch {};
+            frame.status_left_len = @intCast(writer.end);
+            frame.status_right_len = 0;
+            return;
+        }
+        const message = state.message_buffer[0..state.message_len];
+        writer.writeAll(if (message.len > 0) message else state.file_name) catch {};
+        frame.status_left_len = @intCast(writer.end);
+        const pages = state.document.page_sizes.len;
+        if (state.document.generation == 0) {
+            writer.writeAll("loading...") catch {};
+        } else if (pages == 0) {
+            writer.writeAll("no pages") catch {};
         } else {
-            const left = if (state.message_len > 0) state.message_buffer[0..state.message_len] else state.file_name;
-            writer.print("{s}  {d}/{d}  {d}%{s}", .{
-                left,
+            writer.print("{d}/{d}  {d}%{s}", .{
                 state.anchor.page + 1,
-                state.page_sizes.len,
+                pages,
                 @as(u32, @intFromFloat(@round(state.zoom * 100))),
                 if (state.dark) "  dark" else "",
             }) catch {};
         }
-        frame.status_len = @intCast(writer.end);
+        frame.status_right_len = @intCast(writer.end - frame.status_left_len);
     }
 };
-
-// ====================================================================================================
-// Private Functions
-// ====================================================================================================
-
-fn eql(a: []const u8, b: []const u8) bool {
-    return std.mem.eql(u8, a, b);
-}
 
 // ====================================================================================================
 // Tests
@@ -286,85 +338,138 @@ fn eql(a: []const u8, b: []const u8) bool {
 
 test {
     _ = keymap;
-    _ = layout_;
+    _ = tiling;
 }
 
 const test_size: terminal.Size = .{ .cols = 80, .rows = 25, .cell_width = 10, .cell_height = 20 };
 /// An 800x480 px view; A4 pages fit to 800 px wide are about 1132 px tall.
 const test_pages: [3]pdf.Size = @splat(.{ .width = 595, .height = 842 });
 
-fn testState() State {
-    var state: State = .init("doc.pdf", test_size, false);
-    _ = state.update(.{ .document = &test_pages });
-    return state;
-}
+const TestViewer = struct {
+    state: State,
+    tops: [3]i64,
 
-fn feed(state: *State, keys: []const u8) Effect {
-    var effect: Effect = .none;
-    for (keys) |byte| effect = state.update(.{ .key = terminal.Key.decode(&.{byte}).key });
-    return effect;
-}
+    /// Heap-free but self-referential: `state` points into `tops`.
+    fn init(viewer: *TestViewer) void {
+        viewer.state = .init("doc.pdf", test_size, false, 1);
+        _ = viewer.state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .tops = &viewer.tops } });
+    }
+
+    fn feed(viewer: *TestViewer, keys: []const u8) Effect {
+        var effect: Effect = .none;
+        for (keys) |byte| effect = viewer.state.update(.{ .key = terminal.Key.decode(&.{byte}).?.key });
+        return effect;
+    }
+};
 
 test "scrolling is clamped to the document" {
-    var state = testState();
-    _ = feed(&state, "k");
-    try std.testing.expectEqual(Anchor{ .page = 0, .y = 0 }, state.anchor);
-    _ = feed(&state, "G");
-    try std.testing.expectEqual(2, state.anchor.page);
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.feed("k");
+    try std.testing.expectEqual(Anchor{ .page = 0, .y = 0 }, viewer.state.anchor);
+    _ = viewer.feed("G");
+    try std.testing.expectEqual(2, viewer.state.anchor.page);
     // Scrolling past the end leaves the last page's bottom at the bottom of
     // the view.
-    _ = feed(&state, "99j");
-    const geometry = state.computeGeometry();
-    try std.testing.expectEqual(geometry.contentHeight() - geometry.view_height, geometry.offsetOf(state.anchor));
+    _ = viewer.feed("99j");
+    const geometry = viewer.state.geometry;
+    try std.testing.expectEqual(geometry.content_height - geometry.view_height, geometry.offsetOf(viewer.state.anchor));
 }
 
 test "page jumps and counts" {
-    var state = testState();
-    _ = feed(&state, "l");
-    try std.testing.expectEqual(Anchor{ .page = 1, .y = 0 }, state.anchor);
-    _ = feed(&state, "gg");
-    try std.testing.expectEqual(0, state.anchor.page);
-    _ = feed(&state, "3G");
-    try std.testing.expectEqual(2, state.anchor.page);
-    _ = feed(&state, "2h");
-    try std.testing.expectEqual(0, state.anchor.page);
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.feed("l");
+    try std.testing.expectEqual(Anchor{ .page = 1, .y = 0 }, viewer.state.anchor);
+    _ = viewer.feed("gg");
+    try std.testing.expectEqual(0, viewer.state.anchor.page);
+    _ = viewer.feed("3G");
+    try std.testing.expectEqual(2, viewer.state.anchor.page);
+    _ = viewer.feed("2h");
+    try std.testing.expectEqual(0, viewer.state.anchor.page);
 }
 
-test "zooming keeps the position in the page" {
-    var state = testState();
-    _ = feed(&state, "lj");
-    const before = state.anchor;
-    _ = feed(&state, "++");
-    try std.testing.expectEqual(before.page, state.anchor.page);
-    try std.testing.expectApproxEqAbs(before.y, state.anchor.y, 0.5);
-    try std.testing.expectApproxEqAbs(1.5625, state.zoom, 0.0001);
-    _ = feed(&state, "=");
-    try std.testing.expectEqual(1, state.zoom);
+test "zooming keeps the position in the page and the centre of the view" {
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.feed("lj");
+    const before = viewer.state.anchor;
+    _ = viewer.feed("++");
+    try std.testing.expectEqual(before.page, viewer.state.anchor.page);
+    try std.testing.expectApproxEqAbs(before.y, viewer.state.anchor.y, 0.5);
+    try std.testing.expectApproxEqAbs(1.5625, viewer.state.zoom, 0.0001);
+    // Centred: the view's 400 px middle maps to 625 px, so pan is 225.
+    try std.testing.expectEqual(225, viewer.state.pan_x);
+    _ = viewer.feed("=");
+    try std.testing.expectEqual(1, viewer.state.zoom);
+    try std.testing.expectEqual(0, viewer.state.pan_x);
 }
 
 test "command line" {
-    var state = testState();
-    _ = feed(&state, ":3\r");
-    try std.testing.expectEqual(2, state.anchor.page);
-    try std.testing.expect(!state.command_open);
-    _ = feed(&state, ":zoom 50\r");
-    try std.testing.expectEqual(0.5, state.zoom);
-    try std.testing.expectEqual(.reload, feed(&state, ":reload\r"));
-    try std.testing.expectEqual(.quit, feed(&state, ":q\r"));
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.feed(":3\r");
+    try std.testing.expectEqual(2, viewer.state.anchor.page);
+    try std.testing.expect(!viewer.state.command_open);
+    _ = viewer.feed(":zoom 50\r");
+    try std.testing.expectEqual(0.5, viewer.state.zoom);
+    try std.testing.expectEqual(.reload, viewer.feed(":reload\r"));
+    try std.testing.expectEqual(.quit, viewer.feed(":q\r"));
 
-    _ = feed(&state, ":nope\r");
+    _ = viewer.feed(":nope\r");
     var frame: Frame = undefined;
-    state.layout(&frame);
-    try std.testing.expect(std.mem.startsWith(u8, frame.status(), "unknown command"));
-    // Backspace on an empty command line closes it.
-    _ = feed(&state, ":x\x7f\x7f");
-    try std.testing.expect(!state.command_open);
+    viewer.state.layout(&frame);
+    try std.testing.expectEqualStrings("unknown command", frame.status().left);
+    for ([_][]const u8{ ":zoom -5\r", ":zoom nan\r", ":zoom 0x10\r", ":zoom 50 extra\r" }) |keys| {
+        _ = viewer.feed(keys);
+        try std.testing.expectEqual(0.5, viewer.state.zoom);
+    }
+    _ = viewer.feed(":99999999999\r");
+    try std.testing.expectEqual(2, viewer.state.anchor.page);
+    // Backspace removes whole characters, then closes the empty line.
+    _ = viewer.state.update(.{ .key = .{ .char = ':' } });
+    _ = viewer.state.update(.{ .key = .{ .char = 0xe9 } });
+    _ = viewer.state.update(.{ .key = .backspace });
+    try std.testing.expectEqual(0, viewer.state.command_len);
+    _ = viewer.state.update(.{ .key = .backspace });
+    try std.testing.expect(!viewer.state.command_open);
 }
 
 test "a reload keeps the position, clamped to the new page count" {
-    var state = testState();
-    _ = feed(&state, "G");
-    _ = state.update(.{ .document = test_pages[0..1] });
-    try std.testing.expectEqual(0, state.anchor.page);
-    try std.testing.expectEqual(2, state.generation);
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.feed("G");
+    _ = viewer.state.update(.{ .document = .{ .generation = 2, .page_sizes = test_pages[0..1], .tops = viewer.tops[0..1] } });
+    try std.testing.expectEqual(0, viewer.state.anchor.page);
+}
+
+test "status line" {
+    var frame: Frame = undefined;
+    var state: State = .init("doc.pdf", test_size, false, 1);
+    state.layout(&frame);
+    try std.testing.expectEqualStrings("loading...", frame.status().right);
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &.{}, .tops = &.{} } });
+    state.layout(&frame);
+    try std.testing.expectEqualStrings("no pages", frame.status().right);
+    // Messages still show without pages.
+    _ = state.update(.{ .message = "hello" });
+    state.layout(&frame);
+    try std.testing.expectEqualStrings("hello", frame.status().left);
+}
+
+test "a window with no room for pages draws nothing and doesn't crash" {
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.state.update(.{ .resize = .{ .cols = 10, .rows = 1, .cell_width = 10, .cell_height = 20 } });
+    _ = viewer.feed("jjGk");
+    var frame: Frame = undefined;
+    viewer.state.layout(&frame);
+    try std.testing.expectEqual(0, frame.slices().len);
+}
+
+test "the first page applies once the document arrives" {
+    var tops: [3]i64 = undefined;
+    var state: State = .init("doc.pdf", test_size, false, 3);
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .tops = &tops } });
+    try std.testing.expectEqual(2, state.anchor.page);
 }

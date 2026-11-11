@@ -47,23 +47,25 @@ pub const KeyMap = struct {
     /// Returns the action `key` completes, or null if it only starts or
     /// extends one (a count digit, the first `g`) or is unbound.
     pub fn feed(map: *KeyMap, key: Key) ?Action {
-        if (map.pending_g) {
-            map.pending_g = false;
-            const count = map.takeCount();
-            if (key == .char and key.char == 'g') return .{ .goto_page = count orelse 1 };
-            return null;
-        }
         if (key == .char) switch (key.char) {
-            '1'...'9' => return map.appendDigit(@intCast(key.char - '0')),
-            '0' => if (map.count != null) return map.appendDigit(0),
-            'g' => {
+            // A leading zero is not a count.
+            '0'...'9' => if (!map.pending_g and (key.char != '0' or map.count != null)) {
+                map.count = @min(count_max, (map.count orelse 0) * 10 + @as(u32, @intCast(key.char - '0')));
+                return null;
+            },
+            'g' => if (!map.pending_g) {
                 map.pending_g = true;
                 return null;
             },
             else => {},
         };
 
-        const count = map.takeCount();
+        // Anything else completes or cancels the pending count and `g`.
+        const count = map.count;
+        const pending_g = map.pending_g;
+        map.count = null;
+        map.pending_g = false;
+        if (pending_g) return if (key == .char and key.char == 'g') .{ .goto_page = count orelse 1 } else null;
         const n: i32 = @intCast(count orelse 1);
         return switch (key) {
             .char => |char| switch (char) {
@@ -97,20 +99,9 @@ pub const KeyMap = struct {
             .page_up => .{ .scroll_screens = -n },
             .home => .{ .goto_page = 1 },
             .end => .goto_last_page,
-            // Escape only cancels the count, which `takeCount` already did.
+            // Escape only cancels the pending count and `g`, done above.
             else => null,
         };
-    }
-
-    fn appendDigit(map: *KeyMap, digit: u32) ?Action {
-        std.debug.assert(digit <= 9);
-        map.count = @min(count_max, (map.count orelse 0) * 10 + digit);
-        return null;
-    }
-
-    fn takeCount(map: *KeyMap) ?u32 {
-        defer map.count = null;
-        return map.count;
     }
 };
 

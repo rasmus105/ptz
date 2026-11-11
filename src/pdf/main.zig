@@ -5,7 +5,7 @@
 //! it (currently PDFium, via `pdfium.zig`) can be replaced without touching
 //! callers. Keep PDFium types and concepts out of the public declarations.
 //!
-//! All functions are safe to call from any thread. PDFium itself is not
+//! A `Document` is safe to use from any thread. PDFium itself is not
 //! thread-safe, so calls are serialized on one process-wide lock; an engine
 //! that can render in parallel would drop that lock without API changes.
 
@@ -20,7 +20,7 @@ const pdfium = @import("pdfium.zig");
 // ====================================================================================================
 
 /// Larger files are refused rather than read into memory.
-pub const file_size_max = 1024 * 1024 * 1024;
+const file_size_max = 1024 * 1024 * 1024;
 
 /// Pages kept parsed between renders. Rendering a page in several tiles
 /// would otherwise parse it once per tile.
@@ -48,26 +48,19 @@ pub const Size = struct {
     height: f32,
 };
 
-/// Caller-owned RGBA pixels, row-major with no padding between rows.
+/// RGBA pixels, row-major with no padding between rows.
 pub const Bitmap = struct {
     width: u32,
     height: u32,
     pixels: []u8,
-
-    pub fn alloc(gpa: std.mem.Allocator, width: u32, height: u32) std.mem.Allocator.Error!Bitmap {
-        return .{ .width = width, .height = height, .pixels = try gpa.alloc(u8, @as(usize, width) * height * 4) };
-    }
-
-    pub fn free(bitmap: Bitmap, gpa: std.mem.Allocator) void {
-        gpa.free(bitmap.pixels);
-    }
 };
 
-/// Which part of a page to render: the page is drawn at `scale` pixels per
-/// point, and the target bitmap receives the pixels starting at (`x`, `y`).
-/// Rendering a page in tiles keeps each bitmap small at high zoom.
+/// Which part of a page to render: the page is scaled to `page_width` by
+/// `page_height` pixels, and the bitmap receives the pixels starting at
+/// (`x`, `y`). Rendering a page in tiles keeps each bitmap small at high zoom.
 pub const View = struct {
-    scale: f32,
+    page_width: u32,
+    page_height: u32,
     x: u32,
     y: u32,
 };
@@ -83,13 +76,16 @@ pub const Document = struct {
     /// Incremented on each page load, to evict the least recently used page.
     load_clock: u64,
 
+    var engine_lock: std.Io.Mutex = .init;
+    var engine_initialized = false;
+
     const LoadedPage = struct {
         index: u32,
         handle: ?*pdfium.FPDF_PAGE,
         last_used: u64,
     };
 
-    pub fn open(io: std.Io, gpa: std.mem.Allocator, path: []const u8, password: ?[:0]const u8) Error!Document {
+    pub fn open(io: std.Io, gpa: std.mem.Allocator, path: []const u8) Error!Document {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_size_max)) catch |err| return switch (err) {
             error.FileNotFound => error.FileNotFound,
             error.AccessDenied, error.PermissionDenied => error.AccessDenied,
@@ -105,8 +101,7 @@ pub const Document = struct {
             pdfium.FPDF_InitLibrary();
             engine_initialized = true;
         }
-        const handle = pdfium.FPDF_LoadMemDocument64(bytes.ptr, bytes.len, if (password) |p| p.ptr else null) orelse
-            return lastError();
+        const handle = pdfium.FPDF_LoadMemDocument64(bytes.ptr, bytes.len, null) orelse return lastError();
         return .{
             .io = io,
             .gpa = gpa,
@@ -145,7 +140,8 @@ pub const Document = struct {
     /// Renders the part of `page` that `view` selects into `target`, on a
     /// white background. Pixels outside the page stay white.
     pub fn render(doc: *Document, page: u32, view: View, target: Bitmap) Error!void {
-        std.debug.assert(view.scale > 0);
+        std.debug.assert(view.page_width > 0);
+        std.debug.assert(view.page_height > 0);
         std.debug.assert(target.pixels.len == @as(usize, target.width) * target.height * 4);
         engine_lock.lockUncancelable(doc.io);
         defer engine_lock.unlock(doc.io);
@@ -161,15 +157,13 @@ pub const Document = struct {
 
         // PDFium draws the whole page at the given size and position, clipped
         // to the bitmap, so a negative position selects a tile.
-        var size: pdfium.FS_SIZEF = undefined;
-        if (pdfium.FPDF_GetPageSizeByIndexF(doc.handle, @intCast(page), &size) == 0) return error.PageNotFound;
         pdfium.FPDF_RenderPageBitmap(
             bitmap,
             handle,
             -@as(c_int, @intCast(view.x)),
             -@as(c_int, @intCast(view.y)),
-            @intFromFloat(@round(size.width * view.scale)),
-            @intFromFloat(@round(size.height * view.scale)),
+            @intCast(view.page_width),
+            @intCast(view.page_height),
             0,
             pdfium.FPDF_ANNOT | pdfium.FPDF_REVERSE_BYTE_ORDER,
         );
@@ -197,13 +191,6 @@ pub const Document = struct {
 };
 
 // ====================================================================================================
-// Fields
-// ====================================================================================================
-
-var engine_lock: std.Io.Mutex = .init;
-var engine_initialized = false;
-
-// ====================================================================================================
 // Private Functions
 // ====================================================================================================
 
@@ -229,44 +216,46 @@ fn lastError() Error {
 // Tests
 // ====================================================================================================
 
+fn testBitmap(gpa: std.mem.Allocator, width: u32, height: u32) !Bitmap {
+    return .{ .width = width, .height = height, .pixels = try gpa.alloc(u8, @as(usize, width) * height * 4) };
+}
+
 fn pixel(bitmap: Bitmap, x: usize, y: usize) [4]u8 {
     return bitmap.pixels[(y * bitmap.width + x) * 4 ..][0..4].*;
 }
 
-test "renders a page in RGBA at the requested scale" {
-    const io = std.testing.io;
+test "renders a page in RGBA at the requested size" {
     const gpa = std.testing.allocator;
-
-    var doc = try Document.open(io, gpa, "src/pdf/testdata/red-square.pdf", null);
+    var doc = try Document.open(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf");
     defer doc.close();
     try std.testing.expectEqual(1, doc.pageCount());
 
     // 200x100 pt page with a red 40x40 pt square at (20, 20) from the bottom left.
     try std.testing.expectEqual(Size{ .width = 200, .height = 100 }, try doc.pageSize(0));
 
-    const bitmap = try Bitmap.alloc(gpa, 400, 200);
-    defer bitmap.free(gpa);
-    try doc.render(0, .{ .scale = 2, .x = 0, .y = 0 }, bitmap);
+    const bitmap = try testBitmap(gpa, 400, 200);
+    defer gpa.free(bitmap.pixels);
+    const view: View = .{ .page_width = 400, .page_height = 200, .x = 0, .y = 0 };
+    try doc.render(0, view, bitmap);
     // Square spans x 40..120 and y 80..160 (from the top) at 2x.
     try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixel(bitmap, 80, 120));
     try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, pixel(bitmap, 300, 40));
 
-    try std.testing.expectError(error.PageNotFound, doc.render(1, .{ .scale = 2, .x = 0, .y = 0 }, bitmap));
+    try std.testing.expectError(error.PageNotFound, doc.render(1, view, bitmap));
 }
 
 test "a tile matches the same region of the whole page" {
-    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    var doc = try Document.open(io, gpa, "src/pdf/testdata/red-square.pdf", null);
+    var doc = try Document.open(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf");
     defer doc.close();
 
-    const whole = try Bitmap.alloc(gpa, 400, 200);
-    defer whole.free(gpa);
-    try doc.render(0, .{ .scale = 2, .x = 0, .y = 0 }, whole);
+    const whole = try testBitmap(gpa, 400, 200);
+    defer gpa.free(whole.pixels);
+    try doc.render(0, .{ .page_width = 400, .page_height = 200, .x = 0, .y = 0 }, whole);
     // A tile straddling the square's top left corner at (40, 80).
-    const tile = try Bitmap.alloc(gpa, 64, 48);
-    defer tile.free(gpa);
-    try doc.render(0, .{ .scale = 2, .x = 20, .y = 60 }, tile);
+    const tile = try testBitmap(gpa, 64, 48);
+    defer gpa.free(tile.pixels);
+    try doc.render(0, .{ .page_width = 400, .page_height = 200, .x = 20, .y = 60 }, tile);
 
     for (0..tile.height) |y| {
         try std.testing.expectEqualSlices(
@@ -278,8 +267,7 @@ test "a tile matches the same region of the whole page" {
 }
 
 test "open reports why a file cannot be loaded" {
-    const io = std.testing.io;
     const gpa = std.testing.allocator;
-    try std.testing.expectError(error.FileNotFound, Document.open(io, gpa, "src/pdf/testdata/missing.pdf", null));
-    try std.testing.expectError(error.InvalidFormat, Document.open(io, gpa, "build.zig", null));
+    try std.testing.expectError(error.FileNotFound, Document.open(std.testing.io, gpa, "src/pdf/testdata/missing.pdf"));
+    try std.testing.expectError(error.InvalidFormat, Document.open(std.testing.io, gpa, "build.zig"));
 }

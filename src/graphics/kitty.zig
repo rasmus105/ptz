@@ -36,17 +36,13 @@ pub const SharedMemoryName = struct {
     buffer: [shared_memory_name_len_max + 1]u8,
     len: u8,
 
+    /// Makes names unique within the process.
+    var counter: std.atomic.Value(u32) = .init(0);
+
     fn slice(name: *const SharedMemoryName) [:0]const u8 {
         return name.buffer[0..name.len :0];
     }
 };
-
-// ====================================================================================================
-// Fields
-// ====================================================================================================
-
-/// Makes shared memory names unique within the process.
-var shared_memory_counter: std.atomic.Value(u32) = .init(0);
 
 // ====================================================================================================
 // Public API
@@ -98,7 +94,7 @@ pub fn share(image: graphics.Image) !SharedMemoryName {
     var name: SharedMemoryName = undefined;
     const printed = std.fmt.bufPrintSentinel(&name.buffer, "/ptz-{d}-{d}", .{
         std.c.getpid(),
-        shared_memory_counter.fetchAdd(1, .monotonic),
+        SharedMemoryName.counter.fetchAdd(1, .monotonic),
     }, 0) catch unreachable;
     name.len = @intCast(printed.len);
 
@@ -160,7 +156,7 @@ pub fn transmit(writer: *std.Io.Writer, id: graphics.ImageId, encoded: graphics.
 /// a pixel offset. `C=1` keeps the cursor still.
 pub fn place(writer: *std.Io.Writer, placement: graphics.Placement) std.Io.Writer.Error!void {
     const source = placement.source;
-    try writer.print("\x1b[{d};{d}H", .{ @as(u32, placement.row) + 1, @as(u32, placement.col) + 1 });
+    try terminal.moveCursor(writer, placement.row, placement.col);
     try writer.print(
         "\x1b_Ga=p,i={d},p=1,x={d},y={d},w={d},h={d},X={d},Y={d},C=1,q=2\x1b\\",
         .{ placement.image, source.x, source.y, source.width, source.height, placement.x_offset, placement.y_offset },

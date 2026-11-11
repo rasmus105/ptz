@@ -92,18 +92,15 @@ pub fn main(init: std.process.Init) !void {
     }, size, null);
     defer viewer.deinit();
 
-    try settle(viewer, emulator);
+    try viewer.settle(&emulator.output);
     var keys = options.keys;
-    while (keys.len > 0) {
-        const bytes, const len = keyBytes(keys) catch |err| std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
+    while (keys.len > 0 and viewer.open_error == null) {
+        var bytes_buffer: [8]u8 = undefined;
+        const bytes, const len = keyBytes(keys, &bytes_buffer) catch |err|
+            std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
         keys = keys[len..];
-        var rest = bytes;
-        while (rest.len > 0) {
-            const decoded = terminal.Key.decode(rest);
-            rest = rest[decoded.len..];
-            _ = viewer.handle(.{ .key = decoded.key });
-        }
-        try settle(viewer, emulator);
+        if (viewer.input(bytes) == .quit) break;
+        try viewer.settle(&emulator.output);
     }
     if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });
 
@@ -131,24 +128,18 @@ pub fn main(init: std.process.Init) !void {
 // Private Functions
 // ====================================================================================================
 
-/// Lets the viewer render and draw until it is idle.
-fn settle(viewer: *app.App, emulator: *Emulator) !void {
-    while (true) {
-        try viewer.collect();
-        if (viewer.open_error != null) return;
-        try viewer.draw(&emulator.output);
-        if (!viewer.renderer.step() and !viewer.dirty) return;
+/// The bytes of the first key in `keys`, written to `buffer`, and how many
+/// bytes of `keys` it took.
+fn keyBytes(keys: []const u8, buffer: *[8]u8) !struct { []const u8, usize } {
+    if (keys[0] != '<') {
+        const len = @min(keys.len, std.unicode.utf8ByteSequenceLength(keys[0]) catch 1);
+        return .{ keys[0..len], len };
     }
-}
-
-/// The bytes of the first key in `keys`, and how many characters it took.
-fn keyBytes(keys: []const u8) !struct { []const u8, usize } {
-    if (keys[0] != '<') return .{ keys[0..1], 1 };
     const end = std.mem.indexOfScalar(u8, keys, '>') orelse return error.Unterminated;
     const name = keys[1..end];
     if (name.len == 3 and std.mem.startsWith(u8, name, "C-") and std.ascii.isLower(name[2])) {
-        const control = &[_]u8{name[2] - 'a' + 1};
-        return .{ control, end + 1 };
+        buffer[0] = name[2] - 'a' + 1;
+        return .{ buffer[0..1], end + 1 };
     }
     for (named_keys) |named| {
         if (std.mem.eql(u8, named[0], name)) return .{ named[1], end + 1 };

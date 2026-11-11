@@ -6,8 +6,6 @@
 //! does one unit of work on the calling thread. The thread only loops over
 //! it, and tests call it directly to run deterministically.
 
-const Renderer = @This();
-
 // std
 const std = @import("std");
 
@@ -17,6 +15,7 @@ const pdf = @import("../pdf/main.zig");
 const viewer = @import("../viewer/main.zig");
 
 // aliases
+const Renderer = @This();
 const Tile = viewer.Tile;
 
 // ====================================================================================================
@@ -24,15 +23,15 @@ const Tile = viewer.Tile;
 // ====================================================================================================
 
 pub const Result = union(enum) {
-    /// The document was (re)loaded. Owns the page sizes.
-    opened: []pdf.Size,
+    /// The document was (re)loaded; owns the page sizes.
+    opened: struct { generation: u32, page_sizes: []pdf.Size },
     open_failed: pdf.Error,
-    tile: struct { key: Tile.Key, encoded: graphics.Encoded },
-    render_failed: Tile.Key,
+    tile: struct { tile: Tile, encoded: graphics.Encoded },
+    render_failed: Tile,
 
     pub fn deinit(result: Result, gpa: std.mem.Allocator) void {
         switch (result) {
-            .opened => |page_sizes| gpa.free(page_sizes),
+            .opened => |opened| gpa.free(opened.page_sizes),
             .tile => |tile| tile.encoded.deinit(gpa),
             .open_failed, .render_failed => {},
         }
@@ -57,12 +56,14 @@ reload_requested: bool,
 /// Tiles to render, most urgent first. Replaced as a whole by `want`.
 wanted: [viewer.wanted_max]Tile,
 wanted_len: u32,
+/// The tile being rendered, which `want` must not queue again.
+rendering: ?Tile,
 results: std.ArrayList(Result),
 stopping: bool,
 
 // Only used by whoever runs `step`:
 document: ?pdf.Document,
-/// Counts successful loads, matching `viewer.State.generation`.
+/// Counts successful loads; tiles of any other generation are skipped.
 generation: u32,
 /// Pixels of the tile being rendered, reused between tiles.
 scratch: []u8,
@@ -92,6 +93,7 @@ pub fn init(
         .reload_requested = true,
         .wanted = undefined,
         .wanted_len = 0,
+        .rendering = null,
         .results = .empty,
         .stopping = false,
         .document = null,
@@ -129,22 +131,31 @@ pub fn reload(renderer: *Renderer) void {
     renderer.condition.signal(renderer.io);
 }
 
-/// Replaces the tiles to render, most urgent first.
+/// Replaces the tiles to render, most urgent first. Tiles being rendered or
+/// waiting to be collected are left out, so they aren't rendered twice.
 pub fn want(renderer: *Renderer, tiles: []const Tile) void {
     std.debug.assert(tiles.len <= renderer.wanted.len);
     renderer.mutex.lockUncancelable(renderer.io);
     defer renderer.mutex.unlock(renderer.io);
-    @memcpy(renderer.wanted[0..tiles.len], tiles);
-    renderer.wanted_len = @intCast(tiles.len);
+    renderer.wanted_len = 0;
+    next: for (tiles) |tile| {
+        if (renderer.rendering != null and std.meta.eql(renderer.rendering.?, tile)) continue;
+        for (renderer.results.items) |result| {
+            if (result == .tile and std.meta.eql(result.tile.tile, tile)) continue :next;
+        }
+        renderer.wanted[renderer.wanted_len] = tile;
+        renderer.wanted_len += 1;
+    }
     renderer.condition.signal(renderer.io);
 }
 
-/// Moves finished results into `results`; the caller frees them.
-pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) std.mem.Allocator.Error!void {
+/// Swaps finished results into `results`, which must be empty and use the
+/// renderer's allocator. The caller frees them.
+pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) void {
+    std.debug.assert(results.items.len == 0);
     renderer.mutex.lockUncancelable(renderer.io);
     defer renderer.mutex.unlock(renderer.io);
-    try results.appendSlice(renderer.gpa, renderer.results.items);
-    renderer.results.clearRetainingCapacity();
+    std.mem.swap(std.ArrayList(Result), results, &renderer.results);
 }
 
 /// Does one unit of work: a pending reload, else the most urgent tile.
@@ -152,30 +163,32 @@ pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) std.mem.All
 pub fn step(renderer: *Renderer) bool {
     renderer.mutex.lockUncancelable(renderer.io);
     const reload_requested = renderer.reload_requested;
-    var tile: ?Tile = null;
-    if (reload_requested) {
-        renderer.reload_requested = false;
-    } else if (renderer.wanted_len > 0) {
-        tile = renderer.wanted[0];
+    renderer.reload_requested = false;
+    if (!reload_requested and renderer.wanted_len > 0) {
+        renderer.rendering = renderer.wanted[0];
         std.mem.copyForwards(Tile, renderer.wanted[0 .. renderer.wanted_len - 1], renderer.wanted[1..renderer.wanted_len]);
         renderer.wanted_len -= 1;
     }
+    const tile = renderer.rendering;
     renderer.mutex.unlock(renderer.io);
 
     const result = if (reload_requested)
         renderer.load()
     else if (tile) |t|
-        renderer.render(t) orelse return true
+        renderer.render(t)
     else
         return false;
 
     renderer.mutex.lockUncancelable(renderer.io);
-    renderer.results.append(renderer.gpa, result) catch {
+    renderer.rendering = null;
+    if (result) |r| renderer.results.append(renderer.gpa, r) catch {
         // Dropping a result only means rendering the tile again later.
-        result.deinit(renderer.gpa);
+        r.deinit(renderer.gpa);
     };
     renderer.mutex.unlock(renderer.io);
-    if (renderer.wake_fd) |fd| _ = std.c.write(fd, "t", 1);
+    if (result != null) if (renderer.wake_fd) |fd| {
+        _ = std.c.write(fd, "t", 1);
+    };
     return true;
 }
 
@@ -197,7 +210,7 @@ fn run(renderer: *Renderer) void {
 }
 
 fn load(renderer: *Renderer) Result {
-    var document = pdf.Document.open(renderer.io, renderer.gpa, renderer.path, null) catch |err|
+    var document = pdf.Document.open(renderer.io, renderer.gpa, renderer.path) catch |err|
         return .{ .open_failed = err };
     const page_sizes = renderer.gpa.alloc(pdf.Size, document.pageCount()) catch {
         document.close();
@@ -209,32 +222,36 @@ fn load(renderer: *Renderer) Result {
     if (renderer.document) |*old| old.close();
     renderer.document = document;
     renderer.generation += 1;
-    return .{ .opened = page_sizes };
+    return .{ .opened = .{ .generation = renderer.generation, .page_sizes = page_sizes } };
 }
 
 /// Renders and encodes `tile`, or returns null if it belongs to another
-/// version of the document than the loaded one.
+/// load of the document than the current one.
 fn render(renderer: *Renderer, tile: Tile) ?Result {
-    if (tile.key.generation != renderer.generation) return null;
+    if (tile.generation != renderer.generation) return null;
     const document = &(renderer.document orelse return null);
 
-    const len = @as(usize, tile.key.width) * tile.height * 4;
+    const len = @as(usize, tile.width()) * tile.height() * 4;
     if (renderer.scratch.len < len) {
         renderer.gpa.free(renderer.scratch);
         renderer.scratch = &.{};
-        renderer.scratch = renderer.gpa.alloc(u8, len) catch return .{ .render_failed = tile.key };
+        renderer.scratch = renderer.gpa.alloc(u8, len) catch return .{ .render_failed = tile };
     }
-    const bitmap: pdf.Bitmap = .{ .width = tile.key.width, .height = tile.height, .pixels = renderer.scratch[0..len] };
-    document.render(tile.key.page, .{ .scale = tile.scale, .x = 0, .y = tile.top() }, bitmap) catch
-        return .{ .render_failed = tile.key };
-    if (tile.key.dark) invert(bitmap.pixels);
+    const bitmap: pdf.Bitmap = .{ .width = tile.width(), .height = tile.height(), .pixels = renderer.scratch[0..len] };
+    document.render(tile.page, .{
+        .page_width = tile.page_width,
+        .page_height = tile.page_height,
+        .x = tile.left(),
+        .y = tile.top(),
+    }, bitmap) catch return .{ .render_failed = tile };
+    if (tile.dark) invert(bitmap.pixels);
 
     const encoded = graphics.Encoded.init(renderer.gpa, renderer.medium, .{
         .width = bitmap.width,
         .height = bitmap.height,
         .pixels = bitmap.pixels,
-    }) catch return .{ .render_failed = tile.key };
-    return .{ .tile = .{ .key = tile.key, .encoded = encoded } };
+    }) catch return .{ .render_failed = tile };
+    return .{ .tile = .{ .tile = tile, .encoded = encoded } };
 }
 
 /// Inverts the colour of RGBA pixels, keeping alpha.
@@ -249,34 +266,59 @@ fn invert(pixels: []u8) void {
 // Tests
 // ====================================================================================================
 
+const test_tile: Tile = .{
+    .generation = 1,
+    .page = 0,
+    .page_width = 400,
+    .page_height = 200,
+    .column = 0,
+    .row = 0,
+    .dark = true,
+};
+
+fn expectCollected(renderer: *Renderer, results: *std.ArrayList(Result)) !void {
+    for (results.items) |result| result.deinit(renderer.gpa);
+    results.clearRetainingCapacity();
+    renderer.collect(results);
+}
+
 test "loads, then renders wanted tiles of the loaded version only" {
     const gpa = std.testing.allocator;
     var renderer: Renderer = undefined;
     renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
     defer renderer.deinit();
-
     var results: std.ArrayList(Result) = .empty;
     defer {
         for (results.items) |result| result.deinit(gpa);
         results.deinit(gpa);
     }
-    try std.testing.expect(renderer.step());
-    try renderer.collect(&results);
-    try std.testing.expectEqual(1, results.items[0].opened.len);
 
-    const tile: Tile = .{
-        .key = .{ .generation = 1, .page = 0, .width = 400, .index = 0, .dark = true },
-        .scale = 2,
-        .height = 200,
-    };
-    var outdated = tile;
-    outdated.key.generation = 0;
-    renderer.want(&.{ outdated, tile });
+    try std.testing.expect(renderer.step());
+    try expectCollected(&renderer, &results);
+    try std.testing.expectEqual(1, results.items[0].opened.generation);
+    try std.testing.expectEqual(1, results.items[0].opened.page_sizes.len);
+
+    var outdated = test_tile;
+    outdated.generation = 0;
+    renderer.want(&.{ outdated, test_tile });
     while (renderer.step()) {}
-    try renderer.collect(&results);
-    try std.testing.expectEqual(2, results.items.len);
-    try std.testing.expectEqual(tile.key, results.items[1].tile.key);
-    try std.testing.expectEqual(400, results.items[1].tile.encoded.width);
+    try expectCollected(&renderer, &results);
+    try std.testing.expectEqual(1, results.items.len);
+    try std.testing.expectEqual(test_tile, results.items[0].tile.tile);
+    try std.testing.expectEqual(400, results.items[0].tile.encoded.width);
+}
+
+test "a finished but uncollected tile is not queued again" {
+    const gpa = std.testing.allocator;
+    var renderer: Renderer = undefined;
+    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    defer renderer.deinit();
+    _ = renderer.step();
+    renderer.want(&.{test_tile});
+    _ = renderer.step();
+    // The UI hasn't collected the tile yet, so it still wants it.
+    renderer.want(&.{test_tile});
+    try std.testing.expect(!renderer.step());
 }
 
 test "invert keeps alpha" {

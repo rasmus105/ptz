@@ -34,6 +34,10 @@ pub const fullscreen_leave = "\x1b[?25h\x1b[?1049l";
 pub const sync_begin = "\x1b[?2026h";
 pub const sync_end = "\x1b[?2026l";
 
+pub const clear_screen = "\x1b[2J";
+pub const style_reverse = "\x1b[7m";
+pub const style_reset = "\x1b[0m";
+
 // ====================================================================================================
 // Types
 // ====================================================================================================
@@ -60,6 +64,9 @@ pub const Size = struct {
 pub const RawMode = struct {
     original: posix.termios,
 
+    /// The settings to restore if the process dies in raw mode.
+    var crash_restore: ?posix.termios = null;
+
     pub fn enter() Error!RawMode {
         const original = posix.tcgetattr(posix.STDIN_FILENO) catch return error.NotATerminal;
         var raw = original;
@@ -72,13 +79,13 @@ pub const RawMode = struct {
         raw.cc[@backingInt(posix.V.MIN)] = 0;
         raw.cc[@backingInt(posix.V.TIME)] = 0;
         posix.tcsetattr(posix.STDIN_FILENO, .NOW, raw) catch return error.NotATerminal;
-        crash_restore = original;
+        RawMode.crash_restore = original;
         return .{ .original = original };
     }
 
     pub fn restore(mode: RawMode) void {
         posix.tcsetattr(posix.STDIN_FILENO, .NOW, mode.original) catch {};
-        crash_restore = null;
+        RawMode.crash_restore = null;
     }
 };
 
@@ -108,14 +115,14 @@ pub const Input = struct {
     }
 };
 
-// ====================================================================================================
-// Fields
-// ====================================================================================================
+/// SIGWINCH handling for `notifyOnResize`.
+const ResizeSignal = struct {
+    var fd: posix.fd_t = -1;
 
-/// The settings to restore if the process dies in raw mode.
-var crash_restore: ?posix.termios = null;
-/// Written to on SIGWINCH; see `notifyOnResize`.
-var resize_fd: posix.fd_t = -1;
+    fn handle(_: posix.SIG) callconv(.c) void {
+        _ = std.c.write(fd, "r", 1);
+    }
+};
 
 // ====================================================================================================
 // Public API
@@ -124,23 +131,28 @@ var resize_fd: posix.fd_t = -1;
 /// Puts the terminal back as it was before raw mode and full screen, for
 /// paths that skip normal cleanup: panics and `std.process.fatal`.
 pub fn restoreAfterCrash() void {
-    const original = crash_restore orelse return;
-    const reset = sync_end ++ fullscreen_leave;
+    const original = RawMode.crash_restore orelse return;
+    const reset = sync_end ++ style_reset ++ fullscreen_leave;
     _ = std.c.write(posix.STDOUT_FILENO, reset, reset.len);
     posix.tcsetattr(posix.STDIN_FILENO, .NOW, original) catch {};
-    crash_restore = null;
+    RawMode.crash_restore = null;
 }
 
 /// Writes a byte to `fd` whenever the window is resized, so an event loop
-/// polling `fd` wakes up.
-pub fn notifyOnResize(fd: posix.fd_t) void {
-    resize_fd = fd;
+/// polling `fd` wakes up. Null stops it.
+pub fn notifyOnResize(fd: ?posix.fd_t) void {
+    ResizeSignal.fd = fd orelse -1;
     const action: posix.Sigaction = .{
-        .handler = .{ .handler = onResize },
+        .handler = .{ .handler = if (fd == null) posix.SIG.DFL else ResizeSignal.handle },
         .mask = posix.sigemptyset(),
         .flags = posix.SA.RESTART,
     };
     posix.sigaction(.WINCH, &action, null);
+}
+
+/// Moves the cursor to a cell, counting from 0.
+pub fn moveCursor(writer: *std.Io.Writer, row: u32, col: u32) std.Io.Writer.Error!void {
+    try writer.print("\x1b[{d};{d}H", .{ row + 1, col + 1 });
 }
 
 /// Window size from the kernel, falling back to asking the terminal for the
@@ -149,7 +161,7 @@ pub fn size(input: *std.Io.Reader, output: *std.Io.Writer) Error!Size {
     var ws: posix.winsize = undefined;
     if (std.c.ioctl(posix.STDOUT_FILENO, posix.T.IOCGWINSZ, &ws) != 0 or ws.col == 0 or ws.row == 0)
         return error.NotATerminal;
-    if (ws.xpixel != 0 and ws.ypixel != 0) return .{
+    if (ws.xpixel >= ws.col and ws.ypixel >= ws.row) return .{
         .cols = ws.col,
         .rows = ws.row,
         .cell_width = ws.xpixel / ws.col,
@@ -194,14 +206,6 @@ pub fn query(input: *std.Io.Reader, output: *std.Io.Writer, comptime request: []
             error.ReadFailed => error.Unexpected,
         };
     }
-}
-
-// ====================================================================================================
-// Private Functions
-// ====================================================================================================
-
-fn onResize(_: posix.SIG) callconv(.c) void {
-    _ = std.c.write(resize_fd, "r", 1);
 }
 
 // ====================================================================================================
