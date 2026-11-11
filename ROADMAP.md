@@ -1,21 +1,21 @@
 
 ## v0.1.0 - Initial
 
-- [ ] Basic homebrew support
-- [ ] Basic navigation (`j/k, Ctrl-d/u, h/l, gg/G, {n}G, q`)
-- [ ] Zoom (`+/-/=`)
-- [ ] Kitty image rendering only
-- [ ] Prerender neighbouring pages in the background
-- [ ] Status line
-- [ ] CI/CD
-- [ ] Dark mode
-- [ ] Command-line (`:`)
+- [x] Basic homebrew support
+- [x] Basic navigation (`j/k, Ctrl-d/u, h/l, gg/G, {n}G, q`)
+- [x] Zoom (`+/-/=`)
+- [x] Kitty image rendering only
+- [x] Prerender neighbouring pages in the background
+- [x] Status line
+- [x] CI/CD
+- [x] Dark mode
+- [x] Command-line (`:`)
+- [x] Automatic (and option for disabling) refreshing
 
 ## v0.2.0 - Polishing
 
 - [ ] Search (`/`, `n/N`)
 - [ ] Non-interactive mode
-- [ ] Automatic (and option for disabling) refreshing
 - [ ] TOC (see Sioyek)
 - [ ] Jumps (`Ctrl+o/i`)
 
