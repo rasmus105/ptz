@@ -273,6 +273,9 @@ pub fn Cli(comptime Options: type, comptime info: Info) type {
 
 fn fieldSpecs(comptime Options: type) [@typeInfo(Options).@"struct".field_names.len]FieldSpec {
     comptime {
+        // Formatting defaults at comptime is costly; scale the budget with
+        // the number of options.
+        @setEvalBranchQuota(20_000 * (@typeInfo(Options).@"struct".field_names.len + 1));
         const info = @typeInfo(Options).@"struct";
         const positional = if (@hasDecl(Options, "positional")) Options.positional else .{};
         const shorts = if (@hasDecl(Options, "shorts")) Options.shorts else .{};
