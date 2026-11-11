@@ -36,7 +36,10 @@ pub const fullscreen_leave = "\x1b[?7h\x1b[?25h\x1b[?1049l";
 pub const sync_begin = "\x1b[?2026h";
 pub const sync_end = "\x1b[?2026l";
 
-pub const clear_screen = "\x1b[2J";
+/// Erases all text from the top left corner down. Unlike erasing the whole
+/// screen (`ESC [2J`), which the kitty protocol defines to delete all images
+/// too, it leaves images alone.
+pub const clear_text = "\x1b[H\x1b[J";
 pub const style_reverse = "\x1b[7m";
 pub const style_reset = "\x1b[0m";
 

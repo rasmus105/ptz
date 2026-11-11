@@ -65,6 +65,8 @@ pub const App = struct {
     pending_input_len: u32,
     /// Whether the screen is out of date.
     dirty: bool,
+    /// Whether text drawn at an earlier window size must be erased.
+    resized: bool,
     /// Set when the document can't be loaded and there is nothing to show.
     open_error: ?pdf.Error,
 
@@ -89,6 +91,7 @@ pub const App = struct {
             .pending_input = undefined,
             .pending_input_len = 0,
             .dirty = true,
+            .resized = false,
             .open_error = null,
         };
         app.renderer.init(io, gpa, options.path, options.medium, wake_fd);
@@ -137,6 +140,7 @@ pub const App = struct {
 
     pub fn resize(app: *App, size: terminal.Size) void {
         app.dirty = true;
+        app.resized = true;
         _ = app.state.update(.{ .resize = size });
     }
 
@@ -167,6 +171,8 @@ pub const App = struct {
         app.dirty = try app.cache.upload(app.gpa, output, frame.wanted(), upload_bytes_per_frame);
 
         try output.writeAll(terminal.sync_begin);
+        if (app.resized) try output.writeAll(terminal.clear_text);
+        app.resized = false;
         try graphics.clearPlacements(output);
         const size = app.state.size;
         for (frame.slices()) |slice| {
@@ -324,9 +330,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
             if (std.mem.indexOfScalar(u8, read_buffer[0..len], 'q') != null) return;
             if (std.mem.indexOfScalar(u8, read_buffer[0..len], 'r') != null) {
                 var stdin: terminal.Input = .init(&read_buffer, 100);
-                const resized = terminal.size(&stdin.interface, output) catch app.state.size;
-                try output.writeAll(terminal.clear_screen);
-                app.resize(resized);
+                app.resize(terminal.size(&stdin.interface, output) catch app.state.size);
             }
         }
         app.collect();
@@ -459,4 +463,32 @@ test "shows the document, and keys move through it" {
     try std.testing.expectEqual([4]u8{ 0, 255, 255, 255 }, dark.pixel(80, 120));
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, dark.pixel(300, 40));
     try std.testing.expect(app.input("q"));
+}
+
+test "tiles stay on screen through a resize that keeps them" {
+    const gpa = std.testing.allocator;
+    const size: terminal.Size = .{ .cols = 40, .rows = 11, .cell_width = 10, .cell_height = 20 };
+    const emulator: *Emulator = try .create(std.testing.io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(std.testing.io, gpa, .{
+        .path = "src/pdf/testdata/red-square.pdf",
+        .page = 1,
+        .dark = false,
+        .watch = false,
+        .medium = .shared_memory,
+    }, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+
+    // Only the height changes, so the same tiles are wanted and are placed
+    // again without being uploaded again.
+    const taller: terminal.Size = .{ .cols = 40, .rows = 12, .cell_width = 10, .cell_height = 20 };
+    try emulator.resize(taller);
+    app.resize(taller);
+    try app.settle(&emulator.output);
+    const screen = try emulator.screenshot(gpa);
+    defer gpa.free(screen.pixels);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, screen.pixel(80, 120));
 }

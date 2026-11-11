@@ -42,7 +42,7 @@ pub const Tile = tiling.Tile;
 pub const Slice = tiling.Slice;
 pub const Anchor = tiling.Anchor;
 pub const tiles_max = tiling.tiles_max;
-pub const tile_bytes_max = tiling.tile_bytes_max;
+pub const wanted_bytes_max = tiling.wanted_bytes_max;
 
 /// A loaded version of the document.
 pub const Document = struct {
@@ -212,7 +212,14 @@ pub const State = struct {
 
     fn scrollBy(state: *State, delta: i64) void {
         if (state.document.page_sizes.len == 0) return;
+        const page = state.centrePage();
         state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(state.anchor) + delta);
+        if (state.centrePage() != page) state.panToPage(state.centrePage());
+    }
+
+    /// The page at the middle of the view, which the user is looking at.
+    fn centrePage(state: *const State) u32 {
+        return state.geometry.pageAt(state.geometry.offsetOf(state.anchor) + state.geometry.view_height / 2);
     }
 
     fn gotoPage(state: *State, page: i64) void {
@@ -220,11 +227,16 @@ pub const State = struct {
         if (pages == 0) return;
         const anchor: Anchor = .{ .page = @intCast(std.math.clamp(page, 0, @as(i64, @intCast(pages - 1)))), .y = 0 };
         state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(anchor));
-        // Keep the page in view horizontally: a narrower page than the last
-        // may lie entirely outside the current pan.
+        state.panToPage(anchor.page);
+    }
+
+    /// Keeps `page` in view horizontally: a narrower page than the last may
+    /// lie entirely outside the current pan.
+    fn panToPage(state: *State, page: u32) void {
         const geometry = state.geometry;
-        const width = geometry.pageWidth(anchor.page);
-        const left = (geometry.content_width - width) / 2;
+        const width = geometry.pageWidth(page);
+        // Content rounds to 0 px wide in a tiny view, where pages are 1 px.
+        const left = (geometry.content_width -| width) / 2;
         state.pan_x = if (width <= geometry.view_width)
             @min((left + width / 2) -| geometry.view_width / 2, geometry.panMax())
         else
@@ -467,6 +479,29 @@ test "jumping to a narrower page brings it into view" {
     for (frame.slices()) |slice| {
         if (slice.tile.page == 1) break;
     } else return error.TestUnexpectedResult;
+}
+
+test "scrolling onto a narrower page brings it into view" {
+    const pages = [_]pdf.Size{ .{ .width = 2000, .height = 100 }, .{ .width = 200, .height = 100 } };
+    const offsets = [_]f64{ 0, 100 };
+    var state: State = .init("doc.pdf", test_size, false, 1);
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &pages, .page_offsets = &offsets } });
+    for (":zoom 800\r") |byte| _ = state.update(.{ .key = terminal.Key.decode(&.{byte}).?.key });
+    state.pan_x = state.geometry.panMax();
+    // The narrow page is too short to reach the top, but fills the view's
+    // middle once scrolled to the end.
+    for (0..20) |_| _ = state.update(.{ .key = .{ .ctrl = 'd' } });
+    var frame: Frame = undefined;
+    state.layout(&frame);
+    for (frame.slices()) |slice| {
+        if (slice.tile.page == 1) break;
+    } else return error.TestUnexpectedResult;
+}
+
+test "a view too small to show pages doesn't crash" {
+    var state: State = .init("doc.pdf", .{ .cols = 1, .rows = 2, .cell_width = 1, .cell_height = 1 }, false, 1);
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .page_offsets = &test_offsets } });
+    for ("-----hl") |byte| _ = state.update(.{ .key = terminal.Key.decode(&.{byte}).?.key });
 }
 
 test "status line" {
