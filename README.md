@@ -2,10 +2,15 @@
 
 Vibe-coded command line executable to render pdfs in the terminal.
 
-**Currently only support kitty graphics protocol.**
+**Currently only supports kitty graphics protocol.**
 
-## Usage
+**Install:**
+```bash
+brew install rasmus105/tap/ptz
+brew upgrade ptz
+```
 
+**Usage:**
 ```bash
 ptz [options] <file>
 
