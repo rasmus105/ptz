@@ -1,6 +1,6 @@
 .{
     .name = .ptz,
-    .version = "0.1.0",
+    .version = "0.1.1-rc.1",
     .minimum_zig_version = "0.17.1",
     .dependencies = .{
         // Prebuilt PDFium shared libraries; only the one matching the target
