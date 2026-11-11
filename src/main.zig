@@ -65,7 +65,7 @@ pub fn main(init: std.process.Init) !void {
     var stdout_buffer: [64 * 1024]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try graphics.draw(stdout, .{ .width = bitmap.width, .height = bitmap.height, .pixels = bitmap.pixels });
+    try graphics.draw(gpa, stdout, .{ .width = bitmap.width, .height = bitmap.height, .pixels = bitmap.pixels });
     try stdout.writeAll("\n");
     try stdout.flush();
 }

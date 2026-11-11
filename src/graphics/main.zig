@@ -34,8 +34,8 @@ pub fn supported(io: std.Io) terminal.Error!bool {
 
 /// Draws `image` at the cursor at its native pixel size. The terminal moves
 /// the cursor past the image afterwards.
-pub fn draw(writer: *std.Io.Writer, image: Image) std.Io.Writer.Error!void {
-    try kitty.draw(writer, image);
+pub fn draw(gpa: std.mem.Allocator, writer: *std.Io.Writer, image: Image) !void {
+    try kitty.draw(gpa, writer, image);
 }
 
 // ====================================================================================================
