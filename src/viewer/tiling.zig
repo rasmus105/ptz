@@ -11,9 +11,6 @@ const std = @import("std");
 const pdf = @import("../pdf/main.zig");
 const terminal = @import("../terminal/main.zig");
 
-// local
-const Frame = @import("main.zig").Frame;
-
 // ====================================================================================================
 // Constants
 // ====================================================================================================
@@ -21,6 +18,10 @@ const Frame = @import("main.zig").Frame;
 /// A tile is at most 8 MiB of RGBA.
 pub const tile_width = 2048;
 pub const tile_height = 1024;
+pub const tile_bytes_max = tile_width * tile_height * 4;
+/// Tiles a layout lists, visible and wanted alike. Bounds the terminal
+/// memory a frame keeps in use to `tiles_max * tile_bytes_max`.
+pub const tiles_max = 32;
 /// Pages are never rendered wider, which keeps pixel offsets far from
 /// overflowing and rendering cost per page bounded.
 pub const page_width_max = 16384;
@@ -87,6 +88,24 @@ pub const Slice = struct {
     y: u32,
 };
 
+/// The result of `layout`.
+pub const Tiles = struct {
+    slices_buffer: [tiles_max]Slice,
+    slices_len: u32,
+    wanted_buffer: [tiles_max]Tile,
+    wanted_len: u32,
+
+    pub fn slices(tiles: *const Tiles) []const Slice {
+        return tiles.slices_buffer[0..tiles.slices_len];
+    }
+
+    /// Tiles that should be ready, most urgent first: the visible ones, then
+    /// those of the next screen down, then of the screen above.
+    pub fn wanted(tiles: *const Tiles) []const Tile {
+        return tiles.wanted_buffer[0..tiles.wanted_len];
+    }
+};
+
 /// What distinguishes tiles beyond geometry.
 pub const Version = struct {
     generation: u32,
@@ -102,8 +121,9 @@ const Origin = struct {
 /// The document's layout at one zoom and window size.
 pub const Geometry = struct {
     page_sizes: []const pdf.Size,
-    /// Offset of each page's top from the document's top, in pixels.
-    tops: []const i64,
+    /// Each page's distance from the first page's top, in points, without
+    /// gaps; see `viewer.Document`.
+    page_offsets: []const f64,
     /// The view excludes the status line.
     view_width: u32,
     view_height: u32,
@@ -113,17 +133,16 @@ pub const Geometry = struct {
     content_width: u32,
     content_height: i64,
 
-    /// Fills `tops`, which must have one element per page and outlive the
-    /// geometry.
-    pub fn init(page_sizes: []const pdf.Size, tops: []i64, size: terminal.Size, zoom: f32) Geometry {
+    pub fn init(page_sizes: []const pdf.Size, page_offsets: []const f64, size: terminal.Size, zoom: f32) Geometry {
         std.debug.assert(zoom > 0);
-        std.debug.assert(tops.len == page_sizes.len);
+        std.debug.assert(page_offsets.len == page_sizes.len);
+        std.debug.assert(size.cols > 0 and size.cell_width > 0 and size.cell_height > 0);
         const view_width = @as(u32, size.cols) * size.cell_width;
         var widest: f32 = 0;
         for (page_sizes) |page| widest = @max(widest, page.width);
         var geometry: Geometry = .{
             .page_sizes = page_sizes,
-            .tops = tops,
+            .page_offsets = page_offsets,
             .view_width = view_width,
             .view_height = @as(u32, size.rows -| 1) * size.cell_height,
             .scale = if (widest == 0) 1 else @min(
@@ -134,12 +153,10 @@ pub const Geometry = struct {
             .content_height = 0,
         };
         geometry.content_width = @intFromFloat(@round(widest * geometry.scale));
-        var top: i64 = 0;
-        for (tops, 0..) |*page_top, page| {
-            page_top.* = top;
-            top += geometry.pageHeight(@intCast(page)) + gap;
+        if (page_sizes.len > 0) {
+            const last: u32 = @intCast(page_sizes.len - 1);
+            geometry.content_height = geometry.pageTop(last) + geometry.pageHeight(last);
         }
-        geometry.content_height = @max(0, top - gap);
         return geometry;
     }
 
@@ -151,13 +168,19 @@ pub const Geometry = struct {
         return @max(1, @as(u32, @intFromFloat(@round(geometry.page_sizes[page].height * geometry.scale))));
     }
 
+    /// Distance of the page's top from the document's top, in pixels.
+    pub fn pageTop(geometry: Geometry, page: u32) i64 {
+        const offset = geometry.page_offsets[page] * geometry.scale;
+        return @as(i64, @intFromFloat(@round(offset))) + @as(i64, page) * gap;
+    }
+
     pub fn panMax(geometry: Geometry) u32 {
         return geometry.content_width -| geometry.view_width;
     }
 
     /// Distance of the anchor from the document's top, in pixels.
     pub fn offsetOf(geometry: Geometry, anchor: Anchor) i64 {
-        return geometry.tops[anchor.page] + @as(i64, @intFromFloat(@round(anchor.y * geometry.scale)));
+        return geometry.pageTop(anchor.page) + @as(i64, @intFromFloat(@round(anchor.y * geometry.scale)));
     }
 
     /// The anchor at `offset` pixels from the document's top, clamped so the
@@ -167,21 +190,21 @@ pub const Geometry = struct {
         const offset_max = @max(0, geometry.content_height - geometry.view_height);
         const clamped = std.math.clamp(offset, 0, offset_max);
         const page = geometry.pageAt(clamped);
-        return .{ .page = page, .y = @as(f32, @floatFromInt(clamped - geometry.tops[page])) / geometry.scale };
+        return .{ .page = page, .y = @as(f32, @floatFromInt(clamped - geometry.pageTop(page))) / geometry.scale };
     }
 
     /// The page whose area, including the gap below it, contains `offset`;
     /// the first or last page for offsets beyond the document.
     fn pageAt(geometry: Geometry, offset: i64) u32 {
-        std.debug.assert(geometry.tops.len > 0);
-        // Index of the first page starting after `offset`, minus one.
-        var low: usize = 0;
-        var high: usize = geometry.tops.len;
+        std.debug.assert(geometry.page_sizes.len > 0);
+        // The first page starting after `offset`, minus one.
+        var low: u32 = 0;
+        var high: u32 = @intCast(geometry.page_sizes.len);
         while (low < high) {
             const middle = low + (high - low) / 2;
-            if (geometry.tops[middle] <= offset) low = middle + 1 else high = middle;
+            if (geometry.pageTop(middle) <= offset) low = middle + 1 else high = middle;
         }
-        return @intCast(low -| 1);
+        return low -| 1;
     }
 };
 
@@ -189,10 +212,10 @@ pub const Geometry = struct {
 // Public API
 // ====================================================================================================
 
-pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, frame: *Frame) void {
-    frame.slices_len = 0;
-    frame.wanted_len = 0;
-    if (geometry.page_sizes.len == 0) return;
+pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, tiles: *Tiles) void {
+    tiles.slices_len = 0;
+    tiles.wanted_len = 0;
+    if (geometry.page_sizes.len == 0 or geometry.view_height == 0) return;
 
     const top = geometry.offsetOf(anchor);
     const height: i64 = geometry.view_height;
@@ -201,10 +224,11 @@ pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, 
         @divFloor(@as(i64, geometry.view_width) - geometry.content_width, 2)
     else
         -@as(i64, pan_x);
+    const origin: Origin = .{ .left = left, .top = top };
     // Visible tiles first, so they also lead the wanted list.
-    addTiles(geometry, version, .{ .left = left, .top = top }, top, top + height, frame, true);
-    addTiles(geometry, version, .{ .left = left, .top = top }, top + height, top + 2 * height, frame, false);
-    addTiles(geometry, version, .{ .left = left, .top = top }, top - height, top, frame, false);
+    addTiles(geometry, version, origin, top, top + height, tiles, true);
+    addTiles(geometry, version, origin, top + height, top + 2 * height, tiles, false);
+    addTiles(geometry, version, origin, top - height, top, tiles, false);
 }
 
 // ====================================================================================================
@@ -213,11 +237,12 @@ pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, 
 
 /// Adds the tiles overlapping document rows [`start`, `end`) and the view's
 /// columns to the wanted list, and with `visible` their visible parts to the
-/// slices. Tiles beyond the frame's capacity are dropped.
-fn addTiles(geometry: Geometry, version: Version, origin: Origin, start: i64, end: i64, frame: *Frame, visible: bool) void {
+/// slices. Tiles beyond the capacity are dropped.
+fn addTiles(geometry: Geometry, version: Version, origin: Origin, start: i64, end: i64, tiles: *Tiles, visible: bool) void {
     var page = geometry.pageAt(start);
-    while (page < geometry.page_sizes.len and geometry.tops[page] < end) : (page += 1) {
-        const page_top = geometry.tops[page];
+    while (page < geometry.page_sizes.len) : (page += 1) {
+        const page_top = geometry.pageTop(page);
+        if (page_top >= end) break;
         const page_width = geometry.pageWidth(page);
         const page_height = geometry.pageHeight(page);
         const page_left = origin.left + @divFloor(@as(i64, geometry.content_width) - page_width, 2);
@@ -242,22 +267,25 @@ fn addTiles(geometry: Geometry, version: Version, origin: Origin, start: i64, en
                     .row = row,
                     .dark = version.dark,
                 };
-                addWanted(frame, tile);
-                if (visible) addSlice(geometry, tile, page_left, page_top, origin.top, frame);
+                if (!addWanted(tiles, tile)) return;
+                if (visible) addSlice(geometry, tile, page_left, page_top, origin.top, tiles);
             }
         }
     }
 }
 
-fn addWanted(frame: *Frame, tile: Tile) void {
-    if (frame.wanted_len == frame.wanted_buffer.len) return;
-    for (frame.wanted()) |other| if (std.meta.eql(other, tile)) return;
-    frame.wanted_buffer[frame.wanted_len] = tile;
-    frame.wanted_len += 1;
+/// Returns false once the list is full.
+fn addWanted(tiles: *Tiles, tile: Tile) bool {
+    for (tiles.wanted()) |other| if (std.meta.eql(other, tile)) return true;
+    if (tiles.wanted_len == tiles_max) return false;
+    tiles.wanted_buffer[tiles.wanted_len] = tile;
+    tiles.wanted_len += 1;
+    return true;
 }
 
-fn addSlice(geometry: Geometry, tile: Tile, page_left: i64, page_top: i64, view_top: i64, frame: *Frame) void {
-    if (frame.slices_len == frame.slices_buffer.len) return;
+fn addSlice(geometry: Geometry, tile: Tile, page_left: i64, page_top: i64, view_top: i64, tiles: *Tiles) void {
+    // Every visible tile is also wanted, so the slices can't overflow first.
+    std.debug.assert(tiles.slices_len < tiles_max);
     const tile_left = page_left + tile.left();
     const tile_top = page_top + tile.top() - view_top;
     const visible_left = @max(tile_left, 0);
@@ -267,7 +295,7 @@ fn addSlice(geometry: Geometry, tile: Tile, page_left: i64, page_top: i64, view_
     std.debug.assert(visible_left < visible_right);
     std.debug.assert(visible_top < visible_bottom);
 
-    frame.slices_buffer[frame.slices_len] = .{
+    tiles.slices_buffer[tiles.slices_len] = .{
         .tile = tile,
         .source_x = @intCast(visible_left - tile_left),
         .source_y = @intCast(visible_top - tile_top),
@@ -276,7 +304,7 @@ fn addSlice(geometry: Geometry, tile: Tile, page_left: i64, page_top: i64, view_
         .x = @intCast(visible_left),
         .y = @intCast(visible_top),
     };
-    frame.slices_len += 1;
+    tiles.slices_len += 1;
 }
 
 // ====================================================================================================
@@ -286,19 +314,30 @@ fn addSlice(geometry: Geometry, tile: Tile, page_left: i64, page_top: i64, view_
 const test_size: terminal.Size = .{ .cols = 80, .rows = 26, .cell_width = 10, .cell_height = 20 };
 const test_version: Version = .{ .generation = 1, .dark = false };
 
+/// Offsets for pages of these sizes, as `viewer.Document` defines them.
+fn testOffsets(comptime pages: []const pdf.Size) [pages.len]f64 {
+    var offsets: [pages.len]f64 = undefined;
+    var offset: f64 = 0;
+    for (pages, &offsets) |page, *page_offset| {
+        page_offset.* = offset;
+        offset += page.height;
+    }
+    return offsets;
+}
+
 test "pages fill the width and are cut into tiles at the view's edges" {
     // Two 400x700 pt pages at 2 px/pt: 800x1400 px, so two tile rows each.
     const pages: [2]pdf.Size = @splat(.{ .width = 400, .height = 700 });
-    var tops: [2]i64 = undefined;
-    const geometry: Geometry = .init(&pages, &tops, test_size, 1);
+    const offsets = testOffsets(&pages);
+    const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     try std.testing.expectEqual(2, geometry.scale);
     try std.testing.expectEqual(500, geometry.view_height);
 
-    var frame: Frame = undefined;
+    var tiles: Tiles = undefined;
     // 1300 px down: the last 100 px of page 0's second tile row, the gap,
     // then the first 388 px of page 1.
-    layout(geometry, geometry.anchorAt(1300), 0, test_version, &frame);
-    const slices = frame.slices();
+    layout(geometry, geometry.anchorAt(1300), 0, test_version, &tiles);
+    const slices = tiles.slices();
     try std.testing.expectEqual(2, slices.len);
     try std.testing.expectEqual(Slice{
         .tile = .{ .generation = 1, .page = 0, .page_width = 800, .page_height = 1400, .column = 0, .row = 1, .dark = false },
@@ -315,7 +354,7 @@ test "pages fill the width and are cut into tiles at the view's edges" {
 
     // Wanted: the visible tiles, none new in the screen below (page 1's
     // first tile reaches past it), then page 0's first tile above.
-    const wanted = frame.wanted();
+    const wanted = tiles.wanted();
     try std.testing.expectEqual(3, wanted.len);
     try std.testing.expectEqual(.{ 0, 1 }, .{ wanted[0].page, wanted[0].row });
     try std.testing.expectEqual(.{ 1, 0 }, .{ wanted[1].page, wanted[1].row });
@@ -325,17 +364,17 @@ test "pages fill the width and are cut into tiles at the view's edges" {
 
 test "narrow content is centred, and only visible columns of wide content are used" {
     const pages = [_]pdf.Size{.{ .width = 400, .height = 100 }};
-    var tops: [1]i64 = undefined;
-    var frame: Frame = undefined;
+    const offsets = testOffsets(&pages);
+    var tiles: Tiles = undefined;
 
-    const zoomed_out: Geometry = .init(&pages, &tops, test_size, 0.5);
-    layout(zoomed_out, .{ .page = 0, .y = 0 }, 0, test_version, &frame);
-    try std.testing.expectEqual(.{ 200, 400, 0 }, .{ frame.slices()[0].x, frame.slices()[0].width, frame.slices()[0].source_x });
+    const zoomed_out: Geometry = .init(&pages, &offsets, test_size, 0.5);
+    layout(zoomed_out, .{ .page = 0, .y = 0 }, 0, test_version, &tiles);
+    try std.testing.expectEqual(.{ 200, 400, 0 }, .{ tiles.slices()[0].x, tiles.slices()[0].width, tiles.slices()[0].source_x });
 
     // 8x: 6400 px wide, panned to 4000: columns 1 (2048..4096) and 2.
-    const zoomed_in: Geometry = .init(&pages, &tops, test_size, 8);
-    layout(zoomed_in, .{ .page = 0, .y = 0 }, 4000, test_version, &frame);
-    const slices = frame.slices();
+    const zoomed_in: Geometry = .init(&pages, &offsets, test_size, 8);
+    layout(zoomed_in, .{ .page = 0, .y = 0 }, 4000, test_version, &tiles);
+    const slices = tiles.slices();
     try std.testing.expectEqual(2, slices.len);
     try std.testing.expectEqual(.{ 1, 4000 - tile_width, 96, 0 }, .{ slices[0].tile.column, slices[0].source_x, slices[0].width, slices[0].x });
     try std.testing.expectEqual(.{ 2, 0, 800 - 96, 96 }, .{ slices[1].tile.column, slices[1].source_x, slices[1].width, slices[1].x });
@@ -343,8 +382,8 @@ test "narrow content is centred, and only visible columns of wide content are us
 
 test "anchors round-trip through offsets and clamp to the document" {
     const pages = [_]pdf.Size{ .{ .width = 400, .height = 700 }, .{ .width = 300, .height = 700 } };
-    var tops: [2]i64 = undefined;
-    const geometry: Geometry = .init(&pages, &tops, test_size, 1);
+    const offsets = testOffsets(&pages);
+    const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     try std.testing.expectEqual(1400 + gap + 1400, geometry.content_height);
     try std.testing.expectEqual(Anchor{ .page = 0, .y = 100 }, geometry.anchorAt(200));
     try std.testing.expectEqual(200, geometry.offsetOf(.{ .page = 0, .y = 100 }));
@@ -356,12 +395,12 @@ test "anchors round-trip through offsets and clamp to the document" {
     try std.testing.expectEqual(geometry.content_height - 500, geometry.offsetOf(geometry.anchorAt(1 << 40)));
 }
 
-test "frame capacity bounds the work for many tiny pages" {
-    var pages: [500]pdf.Size = @splat(.{ .width = 400, .height = 1 });
-    var tops: [500]i64 = undefined;
-    const geometry: Geometry = .init(&pages, &tops, test_size, 1);
-    var frame: Frame = undefined;
-    layout(geometry, .{ .page = 0, .y = 0 }, 0, test_version, &frame);
-    try std.testing.expectEqual(frame.wanted_buffer.len, frame.wanted_len);
-    try std.testing.expect(frame.slices_len <= frame.slices_buffer.len);
+test "the tile limit bounds the work for many tiny pages" {
+    const pages: [500]pdf.Size = @splat(.{ .width = 400, .height = 1 });
+    const offsets = testOffsets(&pages);
+    const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
+    var tiles: Tiles = undefined;
+    layout(geometry, .{ .page = 0, .y = 0 }, 0, test_version, &tiles);
+    try std.testing.expectEqual(tiles_max, tiles.wanted_len);
+    try std.testing.expect(tiles.slices_len <= tiles_max);
 }

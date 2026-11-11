@@ -24,9 +24,11 @@ const posix = std.posix;
 
 const da1_request = "\x1b[c";
 
-/// Switches to the alternate screen and hides the cursor, and back.
-pub const fullscreen_enter = "\x1b[?1049h\x1b[?25l";
-pub const fullscreen_leave = "\x1b[?25h\x1b[?1049l";
+/// Switches to the alternate screen, hides the cursor and turns off line
+/// wrapping, so text reaching the last column of the last row can never
+/// scroll the screen; and back.
+pub const fullscreen_enter = "\x1b[?1049h\x1b[?25l\x1b[?7l";
+pub const fullscreen_leave = "\x1b[?7h\x1b[?25h\x1b[?1049l";
 
 /// Synchronized output (mode 2026): the terminal shows everything between
 /// begin and end at once, so redraws don't flicker. Terminals without it
@@ -115,12 +117,15 @@ pub const Input = struct {
     }
 };
 
-/// SIGWINCH handling for `notifyOnResize`.
-const ResizeSignal = struct {
+/// Signal handling for `notifySignals`.
+const Signals = struct {
     var fd: posix.fd_t = -1;
 
-    fn handle(_: posix.SIG) callconv(.c) void {
-        _ = std.c.write(fd, "r", 1);
+    fn handle(signal: posix.SIG) callconv(.c) void {
+        // The interrupted code may be about to read errno.
+        const saved = std.c._errno().*;
+        defer std.c._errno().* = saved;
+        _ = std.c.write(fd, if (signal == .WINCH) "r" else "q", 1);
     }
 };
 
@@ -138,16 +143,47 @@ pub fn restoreAfterCrash() void {
     RawMode.crash_restore = null;
 }
 
-/// Writes a byte to `fd` whenever the window is resized, so an event loop
-/// polling `fd` wakes up. Null stops it.
-pub fn notifyOnResize(fd: ?posix.fd_t) void {
-    ResizeSignal.fd = fd orelse -1;
+/// Turns signals into bytes written to `fd`, so an event loop polling `fd`
+/// wakes up: `r` when the window is resized, and `q` when asked to stop
+/// (SIGTERM, SIGHUP, SIGINT), which then quits through normal cleanup.
+/// Null restores the default handling.
+pub fn notifySignals(fd: ?posix.fd_t) void {
+    Signals.fd = fd orelse -1;
     const action: posix.Sigaction = .{
-        .handler = .{ .handler = if (fd == null) posix.SIG.DFL else ResizeSignal.handle },
+        .handler = .{ .handler = if (fd == null) posix.SIG.DFL else Signals.handle },
         .mask = posix.sigemptyset(),
         .flags = posix.SA.RESTART,
     };
-    posix.sigaction(.WINCH, &action, null);
+    for ([_]posix.SIG{ .WINCH, .TERM, .HUP, .INT }) |signal| posix.sigaction(signal, &action, null);
+}
+
+/// Cells `text` takes on screen: two for East Asian wide characters and
+/// most emoji, none for combining marks, one otherwise, including for bytes
+/// that aren't valid UTF-8.
+pub fn textWidth(text: []const u8) usize {
+    var width: usize = 0;
+    var rest = text;
+    while (rest.len > 0) {
+        const len = charLen(rest);
+        const char = std.unicode.utf8Decode(rest[0..len]) catch 0xfffd;
+        width += switch (char) {
+            0x0300...0x036f, 0x200b...0x200f, 0xfe00...0xfe0f => 0,
+            0x1100...0x115f, 0x2e80...0xa4cf, 0xac00...0xd7a3, 0xf900...0xfaff, 0xfe30...0xfe4f, 0xff00...0xff60, 0xffe0...0xffe6, 0x1f300...0x1f64f, 0x1f900...0x1f9ff, 0x20000...0x3fffd => 2,
+            else => 1,
+        };
+        rest = rest[len..];
+    }
+    return width;
+}
+
+/// Bytes of the first character in `text`: its UTF-8 sequence, or one for
+/// a byte that doesn't start a valid one.
+pub fn charLen(text: []const u8) usize {
+    std.debug.assert(text.len > 0);
+    const len = std.unicode.utf8ByteSequenceLength(text[0]) catch return 1;
+    if (len > text.len) return 1;
+    _ = std.unicode.utf8Decode(text[0..len]) catch return 1;
+    return len;
 }
 
 /// Moves the cursor to a cell, counting from 0.

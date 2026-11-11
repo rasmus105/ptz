@@ -23,15 +23,18 @@ const Tile = viewer.Tile;
 // ====================================================================================================
 
 pub const Result = union(enum) {
-    /// The document was (re)loaded; owns the page sizes.
-    opened: struct { generation: u32, page_sizes: []pdf.Size },
+    /// The document was (re)loaded; owns the slices. See `viewer.Document`.
+    opened: struct { generation: u32, page_sizes: []pdf.Size, page_offsets: []f64 },
     open_failed: pdf.Error,
     tile: struct { tile: Tile, encoded: graphics.Encoded },
     render_failed: Tile,
 
     pub fn deinit(result: Result, gpa: std.mem.Allocator) void {
         switch (result) {
-            .opened => |opened| gpa.free(opened.page_sizes),
+            .opened => |opened| {
+                gpa.free(opened.page_sizes);
+                gpa.free(opened.page_offsets);
+            },
             .tile => |tile| tile.encoded.deinit(gpa),
             .open_failed, .render_failed => {},
         }
@@ -54,7 +57,7 @@ condition: std.Io.Condition,
 // Guarded by `mutex`:
 reload_requested: bool,
 /// Tiles to render, most urgent first. Replaced as a whole by `want`.
-wanted: [viewer.wanted_max]Tile,
+wanted: [viewer.tiles_max]Tile,
 wanted_len: u32,
 /// The tile being rendered, which `want` must not queue again.
 rendering: ?Tile,
@@ -65,8 +68,6 @@ stopping: bool,
 document: ?pdf.Document,
 /// Counts successful loads; tiles of any other generation are skipped.
 generation: u32,
-/// Pixels of the tile being rendered, reused between tiles.
-scratch: []u8,
 
 // ====================================================================================================
 // Public API
@@ -98,7 +99,6 @@ pub fn init(
         .stopping = false,
         .document = null,
         .generation = 0,
-        .scratch = &.{},
     };
 }
 
@@ -113,7 +113,6 @@ pub fn deinit(renderer: *Renderer) void {
     if (renderer.document) |*document| document.close();
     for (renderer.results.items) |result| result.deinit(renderer.gpa);
     renderer.results.deinit(renderer.gpa);
-    renderer.gpa.free(renderer.scratch);
     renderer.* = undefined;
 }
 
@@ -140,9 +139,11 @@ pub fn want(renderer: *Renderer, tiles: []const Tile) void {
     renderer.wanted_len = 0;
     next: for (tiles) |tile| {
         if (renderer.rendering != null and std.meta.eql(renderer.rendering.?, tile)) continue;
-        for (renderer.results.items) |result| {
-            if (result == .tile and std.meta.eql(result.tile.tile, tile)) continue :next;
-        }
+        for (renderer.results.items) |result| switch (result) {
+            .tile => |done| if (std.meta.eql(done.tile, tile)) continue :next,
+            .render_failed => |failed| if (std.meta.eql(failed, tile)) continue :next,
+            .opened, .open_failed => {},
+        };
         renderer.wanted[renderer.wanted_len] = tile;
         renderer.wanted_len += 1;
     }
@@ -162,6 +163,12 @@ pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) void {
 /// Returns false if there was nothing to do.
 pub fn step(renderer: *Renderer) bool {
     renderer.mutex.lockUncancelable(renderer.io);
+    // Make room for the result first: dropping a load's result would leave
+    // the UI waiting for a generation it never hears about.
+    renderer.results.ensureUnusedCapacity(renderer.gpa, 1) catch {
+        renderer.mutex.unlock(renderer.io);
+        return false;
+    };
     const reload_requested = renderer.reload_requested;
     renderer.reload_requested = false;
     if (!reload_requested and renderer.wanted_len > 0) {
@@ -181,10 +188,7 @@ pub fn step(renderer: *Renderer) bool {
 
     renderer.mutex.lockUncancelable(renderer.io);
     renderer.rendering = null;
-    if (result) |r| renderer.results.append(renderer.gpa, r) catch {
-        // Dropping a result only means rendering the tile again later.
-        r.deinit(renderer.gpa);
-    };
+    if (result) |r| renderer.results.appendAssumeCapacity(r);
     renderer.mutex.unlock(renderer.io);
     if (result != null) if (renderer.wake_fd) |fd| {
         _ = std.c.write(fd, "t", 1);
@@ -212,17 +216,26 @@ fn run(renderer: *Renderer) void {
 fn load(renderer: *Renderer) Result {
     var document = pdf.Document.open(renderer.io, renderer.gpa, renderer.path) catch |err|
         return .{ .open_failed = err };
-    const page_sizes = renderer.gpa.alloc(pdf.Size, document.pageCount()) catch {
+    const page_count = document.pageCount();
+    const page_sizes = renderer.gpa.alloc(pdf.Size, page_count) catch {
         document.close();
         return .{ .open_failed = error.OutOfMemory };
     };
-    for (page_sizes, 0..) |*size, page| {
-        size.* = document.pageSize(@intCast(page)) catch .{ .width = 1, .height = 1 };
+    const page_offsets = renderer.gpa.alloc(f64, page_count) catch {
+        renderer.gpa.free(page_sizes);
+        document.close();
+        return .{ .open_failed = error.OutOfMemory };
+    };
+    var offset: f64 = 0;
+    for (page_sizes, page_offsets, 0..) |*size, *page_offset, page| {
+        size.* = document.pageSize(@intCast(page)) catch .{ .width = pdf.page_size_min, .height = pdf.page_size_min };
+        page_offset.* = offset;
+        offset += size.height;
     }
     if (renderer.document) |*old| old.close();
     renderer.document = document;
     renderer.generation += 1;
-    return .{ .opened = .{ .generation = renderer.generation, .page_sizes = page_sizes } };
+    return .{ .opened = .{ .generation = renderer.generation, .page_sizes = page_sizes, .page_offsets = page_offsets } };
 }
 
 /// Renders and encodes `tile`, or returns null if it belongs to another
@@ -231,26 +244,20 @@ fn render(renderer: *Renderer, tile: Tile) ?Result {
     if (tile.generation != renderer.generation) return null;
     const document = &(renderer.document orelse return null);
 
-    const len = @as(usize, tile.width()) * tile.height() * 4;
-    if (renderer.scratch.len < len) {
-        renderer.gpa.free(renderer.scratch);
-        renderer.scratch = &.{};
-        renderer.scratch = renderer.gpa.alloc(u8, len) catch return .{ .render_failed = tile };
-    }
-    const bitmap: pdf.Bitmap = .{ .width = tile.width(), .height = tile.height(), .pixels = renderer.scratch[0..len] };
+    // Render straight into what will be uploaded.
+    const canvas = graphics.Canvas.init(renderer.gpa, renderer.medium, tile.width(), tile.height()) catch
+        return .{ .render_failed = tile };
     document.render(tile.page, .{
         .page_width = tile.page_width,
         .page_height = tile.page_height,
         .x = tile.left(),
         .y = tile.top(),
-    }, bitmap) catch return .{ .render_failed = tile };
-    if (tile.dark) invert(bitmap.pixels);
-
-    const encoded = graphics.Encoded.init(renderer.gpa, renderer.medium, .{
-        .width = bitmap.width,
-        .height = bitmap.height,
-        .pixels = bitmap.pixels,
-    }) catch return .{ .render_failed = tile };
+    }, .{ .width = canvas.width, .height = canvas.height, .pixels = canvas.pixels }) catch {
+        canvas.deinit(renderer.gpa);
+        return .{ .render_failed = tile };
+    };
+    if (tile.dark) invert(canvas.pixels);
+    const encoded = canvas.finish(renderer.gpa) catch return .{ .render_failed = tile };
     return .{ .tile = .{ .tile = tile, .encoded = encoded } };
 }
 

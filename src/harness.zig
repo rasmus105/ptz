@@ -99,7 +99,7 @@ pub fn main(init: std.process.Init) !void {
         const bytes, const len = keyBytes(keys, &bytes_buffer) catch |err|
             std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
         keys = keys[len..];
-        if (viewer.input(bytes) == .quit) break;
+        if (viewer.input(bytes)) break;
         try viewer.settle(&emulator.output);
     }
     if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });

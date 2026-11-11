@@ -63,6 +63,17 @@ pub const Key = union(enum) {
             if (bytes.len < 3) return null;
             return .{ .key = finalKey(bytes[2], 0), .len = 3 };
         }
+        // OSC, DCS and APC strings, e.g. stray replies to queries, run to
+        // ST (`ESC \`) or BEL.
+        if (bytes[1] == ']' or bytes[1] == 'P' or bytes[1] == '_') {
+            for (bytes[2..], 2..) |byte, i| {
+                if (byte == 0x07) return .{ .key = .unknown, .len = @intCast(i + 1) };
+                if (byte == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '\\') {
+                    return .{ .key = .unknown, .len = @intCast(i + 2) };
+                }
+            }
+            return null;
+        }
         if (bytes[1] != '[') return .{ .key = .escape, .len = 1 };
 
         // CSI: parameters and intermediates, then a final byte in 0x40...0x7e.
@@ -128,11 +139,13 @@ test "lone escape and unrecognized sequences" {
     try expectKeys("\x1bx", &.{ .escape, .{ .char = 'x' } });
     // A query reply and an F-key are skipped as single units.
     try expectKeys("\x1b[?62;22c\x1b[15~q", &.{ .unknown, .unknown, .{ .char = 'q' } });
+    try expectKeys("\x1b_Gi=31;OK\x1b\\\x1b]11;rgb:0/0/0\x07j", &.{ .unknown, .unknown, .{ .char = 'j' } });
 }
 
 test "a sequence cut off at the end waits for the rest" {
     try std.testing.expectEqual(null, Key.decode("\x1b[1;5"));
     try std.testing.expectEqual(null, Key.decode("\x1bO"));
     try std.testing.expectEqual(null, Key.decode("\xc3"));
+    try std.testing.expectEqual(null, Key.decode("\x1b_Gi=31;OK\x1b"));
     try expectKeys("\x1b[1;5C", &.{.right});
 }

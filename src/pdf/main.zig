@@ -22,6 +22,12 @@ const pdfium = @import("pdfium.zig");
 /// Larger files are refused rather than read into memory.
 const file_size_max = 1024 * 1024 * 1024;
 
+/// Page sizes are clamped to this range of points, so a malformed or hostile
+/// document can't make callers compute with zero, negative, huge or NaN
+/// sizes. 100000 pt is about 35 m.
+pub const page_size_min = 1;
+pub const page_size_max = 100_000;
+
 /// Pages kept parsed between renders. Rendering a page in several tiles
 /// would otherwise parse it once per tile.
 const loaded_pages_max = 4;
@@ -32,6 +38,7 @@ const loaded_pages_max = 4;
 
 pub const Error = error{
     FileNotFound,
+    IsDir,
     AccessDenied,
     FileTooBig,
     InvalidFormat,
@@ -42,7 +49,7 @@ pub const Error = error{
     Unexpected,
 };
 
-/// Page size in points (1/72 inch).
+/// Page size in points (1/72 inch), within [`page_size_min`, `page_size_max`].
 pub const Size = struct {
     width: f32,
     height: f32,
@@ -88,6 +95,7 @@ pub const Document = struct {
     pub fn open(io: std.Io, gpa: std.mem.Allocator, path: []const u8) Error!Document {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_size_max)) catch |err| return switch (err) {
             error.FileNotFound => error.FileNotFound,
+            error.IsDir => error.IsDir,
             error.AccessDenied, error.PermissionDenied => error.AccessDenied,
             error.StreamTooLong => error.FileTooBig,
             error.OutOfMemory => error.OutOfMemory,
@@ -134,7 +142,7 @@ pub const Document = struct {
         var size: pdfium.FS_SIZEF = undefined;
         if (pdfium.FPDF_GetPageSizeByIndexF(doc.handle, try pageIndex(doc, page), &size) == 0)
             return error.PageNotFound;
-        return .{ .width = size.width, .height = size.height };
+        return .{ .width = clampSize(size.width), .height = clampSize(size.height) };
     }
 
     /// Renders the part of `page` that `view` selects into `target`, on a
@@ -201,6 +209,11 @@ fn pageIndex(doc: *const Document, page: u32) Error!c_int {
     return @intCast(page);
 }
 
+fn clampSize(points: f32) f32 {
+    if (std.math.isNan(points)) return page_size_min;
+    return std.math.clamp(@abs(points), page_size_min, page_size_max);
+}
+
 fn lastError() Error {
     return switch (pdfium.FPDF_GetLastError()) {
         .file => error.FileNotFound,
@@ -263,6 +276,18 @@ test "a tile matches the same region of the whole page" {
             whole.pixels[((y + 60) * whole.width + 20) * 4 ..][0 .. tile.width * 4],
             tile.pixels[y * tile.width * 4 ..][0 .. tile.width * 4],
         );
+    }
+}
+
+test "page sizes are clamped to a sane range" {
+    const gpa = std.testing.allocator;
+    var doc = try Document.open(std.testing.io, gpa, "src/pdf/testdata/odd-sizes.pdf");
+    defer doc.close();
+    for (0..doc.pageCount()) |page| {
+        const size = try doc.pageSize(@intCast(page));
+        for ([_]f32{ size.width, size.height }) |points| {
+            try std.testing.expect(points >= page_size_min and points <= page_size_max);
+        }
     }
 }
 

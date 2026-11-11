@@ -11,7 +11,6 @@
 const std = @import("std");
 
 // project
-const Emulator = @import("../emulator/main.zig").Emulator;
 const graphics = @import("../graphics/main.zig");
 const pdf = @import("../pdf/main.zig");
 const terminal = @import("../terminal/main.zig");
@@ -35,6 +34,8 @@ const upload_bytes_per_frame = 8 * 1024 * 1024;
 const watch_interval_ms = 250;
 /// The longest key sequence kept while waiting for the rest of it.
 const pending_input_max = 32;
+/// The most bytes `App.input` takes at once.
+pub const input_len_max = 256;
 
 // ====================================================================================================
 // Types
@@ -54,10 +55,9 @@ pub const App = struct {
     state: viewer.State,
     renderer: Renderer,
     cache: Cache,
-    /// The loaded document's page sizes and layout scratch, which `state`
-    /// points to.
+    /// The loaded document's page sizes and offsets, which `state` points to.
     page_sizes: []pdf.Size,
-    tops: []i64,
+    page_offsets: []f64,
     frame: viewer.Frame,
     results: std.ArrayList(Renderer.Result),
     /// The start of a key sequence cut off at the end of the last input.
@@ -81,9 +81,9 @@ pub const App = struct {
             .gpa = gpa,
             .state = .init(std.fs.path.basename(options.path), size, options.dark, options.page),
             .renderer = undefined,
-            .cache = .empty,
+            .cache = .init(Cache.uploaded_bytes_max, Cache.pending_bytes_max),
             .page_sizes = &.{},
-            .tops = &.{},
+            .page_offsets = &.{},
             .frame = undefined,
             .results = .empty,
             .pending_input = undefined,
@@ -100,45 +100,39 @@ pub const App = struct {
         app.results.deinit(app.gpa);
         app.cache.deinit(app.gpa);
         app.gpa.free(app.page_sizes);
-        app.gpa.free(app.tops);
+        app.gpa.free(app.page_offsets);
         app.* = undefined;
     }
 
-    /// Handles bytes typed in the terminal. A key sequence cut off at the
-    /// end is kept until the rest arrives.
-    pub fn input(app: *App, bytes: []const u8) viewer.Effect {
-        var buffer: [pending_input_max + 256]u8 = undefined;
-        var rest = bytes;
-        while (rest.len > 0 or app.pending_input_len > 0) {
-            // Prefix what was left over from last time.
-            const room = buffer.len - app.pending_input_len;
-            const taken = rest[0..@min(rest.len, room)];
-            rest = rest[taken.len..];
-            @memcpy(buffer[0..app.pending_input_len], app.pending_input[0..app.pending_input_len]);
-            @memcpy(buffer[app.pending_input_len..][0..taken.len], taken);
-            var unread = buffer[0 .. app.pending_input_len + taken.len];
-            app.pending_input_len = 0;
+    /// Handles at most `input_len_max` bytes typed in the terminal, and
+    /// returns whether they asked to quit. A key sequence cut off at the end
+    /// is kept until the rest arrives.
+    pub fn input(app: *App, bytes: []const u8) bool {
+        std.debug.assert(bytes.len <= input_len_max);
+        var buffer: [pending_input_max + input_len_max]u8 = undefined;
+        @memcpy(buffer[0..app.pending_input_len], app.pending_input[0..app.pending_input_len]);
+        @memcpy(buffer[app.pending_input_len..][0..bytes.len], bytes);
+        var unread = buffer[0 .. app.pending_input_len + bytes.len];
+        app.pending_input_len = 0;
 
-            while (unread.len > 0) {
-                const decoded = terminal.Key.decode(unread) orelse {
-                    // Too long to be a key sequence: drop it.
-                    if (unread.len > pending_input_max) break;
+        while (unread.len > 0) {
+            const decoded = terminal.Key.decode(unread) orelse {
+                // Longer than any key: drop it rather than wait forever.
+                if (unread.len <= pending_input_max) {
                     @memcpy(app.pending_input[0..unread.len], unread);
                     app.pending_input_len = @intCast(unread.len);
-                    break;
-                };
-                unread = unread[decoded.len..];
-                app.dirty = true;
-                const effect = app.state.update(.{ .key = decoded.key });
-                switch (effect) {
-                    .none => {},
-                    .quit => return .quit,
-                    .reload => app.renderer.reload(),
                 }
+                return false;
+            };
+            unread = unread[decoded.len..];
+            app.dirty = true;
+            switch (app.state.update(.{ .key = decoded.key })) {
+                .none => {},
+                .quit => return true,
+                .reload => app.renderer.reload(),
             }
-            if (rest.len == 0) break;
         }
-        return .none;
+        return false;
     }
 
     pub fn resize(app: *App, size: terminal.Size) void {
@@ -153,9 +147,9 @@ pub const App = struct {
         for (app.results.items, 0..) |result, index| {
             app.dirty = true;
             app.take(result) catch {
-                // Out of memory: drop this and the rest, which only costs
-                // rendering them again.
-                for (app.results.items[index..]) |unused| unused.deinit(app.gpa);
+                // Out of memory: `take` freed this result; drop the rest,
+                // which only costs rendering them again.
+                for (app.results.items[index + 1 ..]) |unused| unused.deinit(app.gpa);
                 _ = app.state.update(.{ .message = "out of memory" });
                 return;
             };
@@ -168,7 +162,7 @@ pub const App = struct {
         const frame = &app.frame;
         app.state.layout(frame);
 
-        var missing: [viewer.wanted_max]viewer.Tile = undefined;
+        var missing: [viewer.tiles_max]viewer.Tile = undefined;
         app.renderer.want(app.cache.findMissing(frame.wanted(), &missing));
         app.dirty = try app.cache.upload(app.gpa, output, frame.wanted(), upload_bytes_per_frame);
 
@@ -208,17 +202,15 @@ pub const App = struct {
     fn take(app: *App, result: Renderer.Result) std.mem.Allocator.Error!void {
         switch (result) {
             .opened => |opened| {
-                errdefer result.deinit(app.gpa);
-                const tops = try app.gpa.alloc(i64, opened.page_sizes.len);
                 _ = app.state.update(.{ .document = .{
                     .generation = opened.generation,
                     .page_sizes = opened.page_sizes,
-                    .tops = tops,
+                    .page_offsets = opened.page_offsets,
                 } });
                 app.gpa.free(app.page_sizes);
-                app.gpa.free(app.tops);
+                app.gpa.free(app.page_offsets);
                 app.page_sizes = opened.page_sizes;
-                app.tops = tops;
+                app.page_offsets = opened.page_offsets;
             },
             .open_failed => |err| {
                 if (app.state.document.generation == 0) app.open_error = err;
@@ -292,8 +284,8 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
     defer for (wake_fds) |fd| {
         _ = std.c.close(fd);
     };
-    terminal.notifyOnResize(wake_fds[1]);
-    defer terminal.notifyOnResize(null);
+    terminal.notifySignals(wake_fds[1]);
+    defer terminal.notifySignals(null);
 
     const app = try gpa.create(App);
     defer gpa.destroy(app);
@@ -303,13 +295,13 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
 
     try output.writeAll(terminal.fullscreen_enter);
     defer {
-        app.cache.clear(gpa, output) catch {};
+        app.cache.clear(gpa, output);
         output.writeAll(terminal.fullscreen_leave) catch {};
         output.flush() catch {};
     }
 
     var watch: Watch = .init(io, options.path);
-    var read_buffer: [256]u8 = undefined;
+    var read_buffer: [input_len_max]u8 = undefined;
     while (true) {
         if (app.dirty) try app.draw(output);
         if (app.open_error) |err| return err;
@@ -325,10 +317,11 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
             const len = try posix.read(posix.STDIN_FILENO, &read_buffer);
             // The terminal went away.
             if (len == 0) return;
-            if (app.input(read_buffer[0..len]) == .quit) return;
+            if (app.input(read_buffer[0..len])) return;
         }
         if (fds[1].revents != 0) {
             const len = try posix.read(wake_fds[0], &read_buffer);
+            if (std.mem.indexOfScalar(u8, read_buffer[0..len], 'q') != null) return;
             if (std.mem.indexOfScalar(u8, read_buffer[0..len], 'r') != null) {
                 var stdin: terminal.Input = .init(&read_buffer, 100);
                 const resized = terminal.size(&stdin.interface, output) catch app.state.size;
@@ -345,15 +338,14 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
 // Private Functions
 // ====================================================================================================
 
-/// The status line in reverse video across the last row. Columns are
-/// counted as code points, which is right for most file names.
+/// The status line in reverse video across the last row.
 fn drawStatus(output: *std.Io.Writer, status: viewer.Status, size: terminal.Size) std.Io.Writer.Error!void {
     const gap = "  ";
     const right = truncate(status.right, size.cols, false);
-    const right_cols = codepoints(right);
+    const right_cols = terminal.textWidth(right);
     const left_room = (size.cols - right_cols) -| if (right_cols > 0) gap.len else 0;
     const left = truncate(status.left, left_room, status.keep_end);
-    const padding = size.cols - right_cols - codepoints(left);
+    const padding = size.cols - right_cols - terminal.textWidth(left);
 
     try terminal.moveCursor(output, size.rows - 1, 0);
     try output.writeAll(terminal.style_reverse);
@@ -363,27 +355,29 @@ fn drawStatus(output: *std.Io.Writer, status: viewer.Status, size: terminal.Size
     try output.writeAll(terminal.style_reset);
 }
 
-/// The longest prefix (or suffix, with `keep_end`) of `text` with at most
-/// `cols` code points.
+/// The longest prefix (or suffix, with `keep_end`) of `text` at most `cols`
+/// cells wide.
 fn truncate(text: []const u8, cols: usize, keep_end: bool) []const u8 {
-    const total = codepoints(text);
-    if (total <= cols) return text;
-    var skip = if (keep_end) total - cols else cols;
-    var index: usize = 0;
-    while (skip > 0 and index < text.len) : (skip -= 1) {
-        index += std.unicode.utf8ByteSequenceLength(text[index]) catch 1;
+    if (terminal.textWidth(text) <= cols) return text;
+    if (keep_end) {
+        var start: usize = 0;
+        while (terminal.textWidth(text[start..]) > cols) start += terminal.charLen(text[start..]);
+        return text[start..];
     }
-    index = @min(index, text.len);
-    return if (keep_end) text[index..] else text[0..index];
-}
-
-fn codepoints(text: []const u8) usize {
-    return std.unicode.utf8CountCodepoints(text) catch text.len;
+    var end: usize = 0;
+    while (end < text.len) {
+        const next = end + terminal.charLen(text[end..]);
+        if (terminal.textWidth(text[0..next]) > cols) break;
+        end = next;
+    }
+    return text[0..end];
 }
 
 // ====================================================================================================
 // Tests
 // ====================================================================================================
+
+const Emulator = @import("../emulator/main.zig").Emulator;
 
 test {
     _ = Cache;
@@ -417,6 +411,14 @@ test "the status line keeps the position visible and fits the width" {
     output.clearRetainingCapacity();
     try drawStatus(&output.writer, .{ .left = ":typed\xc3\xa9 a long command", .right = "", .keep_end = true }, size);
     try std.testing.expect(std.mem.indexOf(u8, output.written(), "\xc3\xa9 a long command") != null);
+
+    // Wide characters take two cells, and invalid bytes one: nothing may
+    // spill past the last column.
+    output.clearRetainingCapacity();
+    try drawStatus(&output.writer, .{ .left = "\xe6\x97\xa5\xe6\x9c\xac\xff-name-that-is-long", .right = "1/2", .keep_end = false }, size);
+    const line = output.written()[std.mem.indexOf(u8, output.written(), terminal.style_reverse).? + terminal.style_reverse.len ..];
+    const text = line[0..std.mem.indexOf(u8, line, terminal.style_reset).?];
+    try std.testing.expectEqual(16, terminal.textWidth(text));
 }
 
 test "shows the document, and keys move through it" {
@@ -449,12 +451,12 @@ test "shows the document, and keys move through it" {
 
     // Dark mode inverts the page; the `i` arrives split from nothing, and
     // an arrow key split across two inputs is still one key.
-    try std.testing.expectEqual(.none, app.input("\x1b["));
-    try std.testing.expectEqual(.none, app.input("Bi"));
+    try std.testing.expect(!app.input("\x1b["));
+    try std.testing.expect(!app.input("Bi"));
     try app.settle(&emulator.output);
     const dark = try emulator.screenshot(gpa);
     defer gpa.free(dark.pixels);
     try std.testing.expectEqual([4]u8{ 0, 255, 255, 255 }, dark.pixel(80, 120));
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, dark.pixel(300, 40));
-    try std.testing.expectEqual(.quit, app.input("q"));
+    try std.testing.expect(app.input("q"));
 }

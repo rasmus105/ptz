@@ -24,7 +24,16 @@ const image_id_base: graphics.ImageId = 0x7074_0000;
 /// Decoded pixel bytes ptz keeps in the terminal. Kitty's default quota is
 /// 320 MB per screen; staying below it avoids the terminal silently
 /// evicting tiles that are on screen.
-const uploaded_bytes_max = 256 * 1024 * 1024;
+pub const uploaded_bytes_max = 256 * 1024 * 1024;
+
+/// Pixel bytes of rendered tiles kept while not wanted, e.g. when scrolling
+/// back. Shared memory tiles hold this much memory in the kernel.
+pub const pending_bytes_max = 128 * 1024 * 1024;
+
+comptime {
+    // A frame's tiles must fit, or eviction would have to delete visible ones.
+    std.debug.assert(viewer.tiles_max * viewer.tile_bytes_max <= uploaded_bytes_max);
+}
 
 // ====================================================================================================
 // Types
@@ -48,7 +57,11 @@ const Entry = struct {
 
 entries: std.AutoArrayHashMapUnmanaged(Tile, Entry),
 next_id: graphics.ImageId,
+/// Budgets; the constants above except in tests.
+uploaded_budget_bytes: u64,
+pending_budget_bytes: u64,
 uploaded_bytes: u64,
+pending_bytes: u64,
 /// Advanced once per frame by `evict`.
 clock: u64,
 
@@ -56,7 +69,17 @@ clock: u64,
 // Public API
 // ====================================================================================================
 
-pub const empty: Cache = .{ .entries = .empty, .next_id = image_id_base, .uploaded_bytes = 0, .clock = 1 };
+pub fn init(uploaded_budget_bytes: u64, pending_budget_bytes: u64) Cache {
+    return .{
+        .entries = .empty,
+        .next_id = image_id_base,
+        .uploaded_budget_bytes = uploaded_budget_bytes,
+        .pending_budget_bytes = pending_budget_bytes,
+        .uploaded_bytes = 0,
+        .pending_bytes = 0,
+        .clock = 1,
+    };
+}
 
 pub fn deinit(cache: *Cache, gpa: std.mem.Allocator) void {
     for (cache.entries.values()) |entry| if (entry.state == .pending) entry.state.pending.deinit(gpa);
@@ -66,9 +89,12 @@ pub fn deinit(cache: *Cache, gpa: std.mem.Allocator) void {
 
 /// Takes ownership of `encoded`.
 pub fn put(cache: *Cache, gpa: std.mem.Allocator, tile: Tile, encoded: graphics.Encoded) std.mem.Allocator.Error!void {
+    std.debug.assert(encoded.width == tile.width());
+    std.debug.assert(encoded.height == tile.height());
     errdefer encoded.deinit(gpa);
     const slot = try cache.entries.getOrPut(gpa, tile);
     if (slot.found_existing) return encoded.deinit(gpa);
+    cache.pending_bytes += bytes(tile);
     slot.value_ptr.* = .{ .id = cache.next_id, .state = .{ .pending = encoded }, .last_used = cache.clock };
     cache.next_id = if (cache.next_id == std.math.maxInt(graphics.ImageId)) image_id_base else cache.next_id + 1;
 }
@@ -106,7 +132,8 @@ pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, til
         if (written > 0 and written + encoded.transmitLen() > budget_bytes) return true;
         written += encoded.transmitLen();
         entry.state = .uploaded;
-        cache.uploaded_bytes += @as(u64, tile.width()) * tile.height() * 4;
+        cache.pending_bytes -= bytes(tile);
+        cache.uploaded_bytes += bytes(tile);
         try graphics.transmit(gpa, writer, entry.id, encoded);
     }
     return false;
@@ -133,59 +160,84 @@ pub fn shown(cache: *Cache, tile: Tile) ?graphics.ImageId {
     return entry.id;
 }
 
-/// Ends the frame: drops tiles that weren't used in it and aren't uploaded,
-/// then deletes the least recently used uploads until they fit the budget.
+/// Ends the frame: forgets failures not seen this frame, so they are tried
+/// again when back in view, and drops the least recently used pending and
+/// uploaded tiles until each kind fits its budget. Tiles used this frame
+/// are kept.
 pub fn evict(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
     var index: usize = 0;
     while (index < cache.entries.count()) {
         const entry = cache.entries.values()[index];
-        if (entry.state != .uploaded and entry.last_used < cache.clock) {
-            if (entry.state == .pending) entry.state.pending.deinit(gpa);
+        if (entry.state == .failed and entry.last_used < cache.clock) {
             cache.entries.swapRemoveAt(index);
         } else index += 1;
     }
-    while (cache.uploaded_bytes > uploaded_bytes_max) {
-        var oldest: ?usize = null;
-        for (cache.entries.values(), 0..) |entry, i| {
-            if (entry.state != .uploaded or entry.last_used == cache.clock) continue;
-            if (oldest == null or entry.last_used < cache.entries.values()[oldest.?].last_used) oldest = i;
-        }
-        const evicted = oldest orelse break;
-        const tile = cache.entries.keys()[evicted];
+    while (cache.pending_bytes > cache.pending_budget_bytes) {
+        const evicted = cache.leastRecentlyUsed(.pending) orelse break;
+        cache.entries.values()[evicted].state.pending.deinit(gpa);
+        cache.pending_bytes -= bytes(cache.entries.keys()[evicted]);
+        cache.entries.swapRemoveAt(evicted);
+    }
+    while (cache.uploaded_bytes > cache.uploaded_budget_bytes) {
+        const evicted = cache.leastRecentlyUsed(.uploaded) orelse break;
         try graphics.free(writer, cache.entries.values()[evicted].id);
-        cache.uploaded_bytes -= @as(u64, tile.width()) * tile.height() * 4;
+        cache.uploaded_bytes -= bytes(cache.entries.keys()[evicted]);
         cache.entries.swapRemoveAt(evicted);
     }
     cache.clock += 1;
 }
 
-/// Deletes every uploaded tile from the terminal and forgets all tiles.
-pub fn clear(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+/// Forgets all tiles, deleting uploaded ones from the terminal as far as
+/// `writer` still works: this runs while shutting down, when the terminal
+/// may be gone.
+pub fn clear(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer) void {
     for (cache.entries.values()) |entry| switch (entry.state) {
         .pending => |encoded| encoded.deinit(gpa),
-        .uploaded => try graphics.free(writer, entry.id),
+        .uploaded => graphics.free(writer, entry.id) catch {},
         .failed => {},
     };
     cache.entries.clearRetainingCapacity();
     cache.uploaded_bytes = 0;
+    cache.pending_bytes = 0;
+}
+
+// ====================================================================================================
+// Private Functions
+// ====================================================================================================
+
+fn bytes(tile: Tile) u64 {
+    return @as(u64, tile.width()) * tile.height() * 4;
+}
+
+/// The index of the least recently used entry in `state`, not used this
+/// frame.
+fn leastRecentlyUsed(cache: *const Cache, state: std.meta.Tag(@FieldType(Entry, "state"))) ?usize {
+    var oldest: ?usize = null;
+    for (cache.entries.values(), 0..) |entry, index| {
+        if (entry.state != state or entry.last_used == cache.clock) continue;
+        if (oldest == null or entry.last_used < cache.entries.values()[oldest.?].last_used) oldest = index;
+    }
+    return oldest;
 }
 
 // ====================================================================================================
 // Tests
 // ====================================================================================================
 
+/// A 16x16 tile: 1 KiB of pixels.
 fn testTile(page: u32, generation: u32) Tile {
-    return .{ .generation = generation, .page = page, .page_width = 2048, .page_height = 1024, .column = 0, .row = 0, .dark = false };
+    return .{ .generation = generation, .page = page, .page_width = 16, .page_height = 16, .column = 0, .row = 0, .dark = false };
 }
 
 fn testEncoded(gpa: std.mem.Allocator) !graphics.Encoded {
-    // The real size is irrelevant: the cache counts the tile's size.
-    return .init(gpa, .direct, .{ .width = 1, .height = 1, .pixels = &.{ 0, 0, 0, 255 } });
+    const canvas: graphics.Canvas = try .init(gpa, .direct, 16, 16);
+    @memset(canvas.pixels, 0);
+    return canvas.finish(gpa);
 }
 
 test "tiles are uploaded once and stand in for other versions of their area" {
     const gpa = std.testing.allocator;
-    var cache: Cache = .empty;
+    var cache: Cache = .init(1 << 20, 1 << 20);
     defer cache.deinit(gpa);
     var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
@@ -205,45 +257,57 @@ test "tiles are uploaded once and stand in for other versions of their area" {
     try std.testing.expectEqual(sent, output.written().len);
 }
 
-test "unused pending tiles are dropped and old uploads are deleted over budget" {
+test "each kind of tile is kept within its budget, least recently used first" {
     const gpa = std.testing.allocator;
-    var cache: Cache = .empty;
+    // Room for three uploaded and two pending 1 KiB tiles.
+    var cache: Cache = .init(3 * 1024, 2 * 1024);
     defer cache.deinit(gpa);
     var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
 
-    // Each test tile is 8 MiB of pixels: 33 of them exceed the 256 MiB budget.
-    const count = uploaded_bytes_max / (2048 * 1024 * 4) + 1;
-    for (0..count) |page| {
+    for (0..4) |page| {
         const tile = testTile(@intCast(page), 1);
         try cache.put(gpa, tile, try testEncoded(gpa));
         _ = try cache.upload(gpa, &output.writer, &.{tile}, 1 << 20);
         try cache.evict(gpa, &output.writer);
     }
-    // The first, least recently used, was deleted.
-    try std.testing.expectEqual(count - 1, cache.entries.count());
     try std.testing.expectEqual(null, cache.shown(testTile(0, 1)));
+    try std.testing.expect(cache.shown(testTile(1, 1)) != null);
+    try std.testing.expectEqual(3 * 1024, cache.uploaded_bytes);
 
-    try cache.put(gpa, testTile(1000, 1), try testEncoded(gpa));
+    // Put this frame, so kept until the next.
+    for (10..13) |page| try cache.put(gpa, testTile(@intCast(page), 1), try testEncoded(gpa));
     try cache.evict(gpa, &output.writer);
+    try std.testing.expectEqual(3 * 1024, cache.pending_bytes);
     try cache.evict(gpa, &output.writer);
-    try std.testing.expectEqual(count - 1, cache.entries.count());
+    try std.testing.expectEqual(2 * 1024, cache.pending_bytes);
 }
 
 test "tiles used this frame are kept even over budget" {
     const gpa = std.testing.allocator;
-    var cache: Cache = .empty;
+    var cache: Cache = .init(1024, 1024);
     defer cache.deinit(gpa);
     var output: std.Io.Writer.Allocating = .init(gpa);
     defer output.deinit();
 
-    const count = uploaded_bytes_max / (2048 * 1024 * 4) + 1;
-    var tiles: [count]Tile = undefined;
-    for (&tiles, 0..) |*tile, page| {
-        tile.* = testTile(@intCast(page), 1);
-        try cache.put(gpa, tile.*, try testEncoded(gpa));
-    }
-    _ = try cache.upload(gpa, &output.writer, &tiles, 1 << 30);
+    const tiles = [_]Tile{ testTile(0, 1), testTile(1, 1), testTile(2, 1) };
+    for (tiles) |tile| try cache.put(gpa, tile, try testEncoded(gpa));
+    _ = try cache.upload(gpa, &output.writer, &tiles, 1 << 20);
     try cache.evict(gpa, &output.writer);
-    try std.testing.expectEqual(count, cache.entries.count());
+    try std.testing.expectEqual(3, cache.entries.count());
+}
+
+test "clear forgets everything even when the terminal is gone" {
+    const gpa = std.testing.allocator;
+    var cache: Cache = .init(1 << 20, 1 << 20);
+    defer cache.deinit(gpa);
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    try cache.put(gpa, testTile(0, 1), try testEncoded(gpa));
+    _ = try cache.upload(gpa, &output.writer, &.{testTile(0, 1)}, 1 << 20);
+    try cache.put(gpa, testTile(1, 1), try testEncoded(gpa));
+
+    var failing: std.Io.Writer = .failing;
+    cache.clear(gpa, &failing);
+    try std.testing.expectEqual(0, cache.entries.count());
 }

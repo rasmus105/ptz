@@ -57,6 +57,7 @@ pub fn main(init: std.process.Init) !void {
         .medium = medium,
     }, size, stdout) catch |err| switch (err) {
         error.FileNotFound => fail("cannot open '{s}': file not found", .{options.file}),
+        error.IsDir => fail("cannot open '{s}': is a directory", .{options.file}),
         error.AccessDenied => fail("cannot open '{s}': permission denied", .{options.file}),
         error.FileTooBig => fail("cannot open '{s}': file too big", .{options.file}),
         error.InvalidFormat => fail("cannot open '{s}': not a PDF file, or corrupted", .{options.file}),

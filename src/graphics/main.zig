@@ -16,6 +16,7 @@ const terminal = @import("../terminal/main.zig");
 
 // local
 const kitty = @import("kitty.zig");
+const shm = @import("shm.zig");
 
 // ====================================================================================================
 // Types
@@ -25,13 +26,6 @@ const kitty = @import("kitty.zig");
 /// other program in the terminal, so pick them from a range unlikely to be
 /// used elsewhere.
 pub const ImageId = u32;
-
-pub const Image = struct {
-    width: u32,
-    height: u32,
-    /// RGBA, row-major with no padding between rows.
-    pixels: []const u8,
-};
 
 /// How image data reaches the terminal.
 pub const Medium = enum {
@@ -44,38 +38,85 @@ pub const Medium = enum {
     shared_memory,
 };
 
-/// An image ready to transmit: preparing it is the expensive part of an
-/// upload, and is safe to do off the UI thread.
+/// Pixels being prepared for upload: render RGBA into `pixels`, then
+/// `finish`. With shared memory, `pixels` is the shared memory itself, so
+/// filling it costs no copy. Safe to use off the UI thread.
+pub const Canvas = struct {
+    width: u32,
+    height: u32,
+    pixels: []u8,
+    target: union(Medium) {
+        /// `pixels` is allocated and gets compressed by `finish`.
+        direct,
+        shared_memory: shm.Object,
+    },
+
+    pub fn init(gpa: std.mem.Allocator, medium: Medium, width: u32, height: u32) !Canvas {
+        std.debug.assert(width > 0 and height > 0);
+        const len = @as(usize, width) * height * 4;
+        return switch (medium) {
+            .direct => .{ .width = width, .height = height, .pixels = try gpa.alloc(u8, len), .target = .direct },
+            .shared_memory => blk: {
+                const object = try shm.Object.create(len);
+                break :blk .{ .width = width, .height = height, .pixels = object.memory, .target = .{ .shared_memory = object } };
+            },
+        };
+    }
+
+    /// Abandons the canvas.
+    pub fn deinit(canvas: Canvas, gpa: std.mem.Allocator) void {
+        switch (canvas.target) {
+            .direct => gpa.free(canvas.pixels),
+            .shared_memory => |object| {
+                object.unmap();
+                object.name.unlink();
+            },
+        }
+    }
+
+    /// Consumes the canvas, also on error.
+    pub fn finish(canvas: Canvas, gpa: std.mem.Allocator) !Encoded {
+        const data: Encoded.Data = switch (canvas.target) {
+            .direct => blk: {
+                defer gpa.free(canvas.pixels);
+                break :blk .{ .direct = try kitty.encode(gpa, canvas.pixels) };
+            },
+            .shared_memory => |object| blk: {
+                object.unmap();
+                break :blk .{ .shared_memory = object.name };
+            },
+        };
+        return .{ .width = canvas.width, .height = canvas.height, .data = data };
+    }
+};
+
+/// An image ready to transmit.
 pub const Encoded = struct {
     width: u32,
     height: u32,
-    data: union(Medium) {
+    data: Data,
+
+    pub const Data = union(Medium) {
         /// Base64 of the zlib-compressed pixels, owned.
         direct: []const u8,
-        /// Name of the shared memory object holding the pixels.
-        shared_memory: kitty.SharedMemoryName,
-    },
-
-    pub fn init(gpa: std.mem.Allocator, medium: Medium, image: Image) !Encoded {
-        return .{ .width = image.width, .height = image.height, .data = switch (medium) {
-            .direct => .{ .direct = try kitty.encode(gpa, image) },
-            .shared_memory => .{ .shared_memory = try kitty.share(image) },
-        } };
-    }
+        /// The shared memory object holding the pixels.
+        shared_memory: shm.Name,
+    };
 
     /// Frees an image that won't be transmitted.
     pub fn deinit(encoded: Encoded, gpa: std.mem.Allocator) void {
         switch (encoded.data) {
             .direct => |base64| gpa.free(base64),
-            .shared_memory => |name| kitty.unshare(name),
+            .shared_memory => |name| name.unlink(),
         }
     }
 
-    /// Bytes `transmit` writes to the terminal.
+    /// Image data `transmit` writes to the terminal, in bytes; shared
+    /// memory needs only a short command.
     pub fn transmitLen(encoded: Encoded) usize {
         return switch (encoded.data) {
             .direct => |base64| base64.len,
-            .shared_memory => 64,
+            .shared_memory => 0,
         };
     }
 };
@@ -139,4 +180,5 @@ pub fn free(writer: *std.Io.Writer, id: ImageId) std.Io.Writer.Error!void {
 
 test {
     _ = kitty;
+    _ = shm;
 }

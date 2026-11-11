@@ -32,7 +32,6 @@ const zoom_max = 8;
 const line_rows = 2;
 const command_len_max = 128;
 const message_len_max = 160;
-const slices_max = 64;
 const status_len_max = 512;
 
 // ====================================================================================================
@@ -42,7 +41,8 @@ const status_len_max = 512;
 pub const Tile = tiling.Tile;
 pub const Slice = tiling.Slice;
 pub const Anchor = tiling.Anchor;
-pub const wanted_max = 64;
+pub const tiles_max = tiling.tiles_max;
+pub const tile_bytes_max = tiling.tile_bytes_max;
 
 /// A loaded version of the document.
 pub const Document = struct {
@@ -50,8 +50,10 @@ pub const Document = struct {
     /// are never mistaken for current ones.
     generation: u32,
     page_sizes: []const pdf.Size,
-    /// Scratch space for the layout, one element per page.
-    tops: []i64,
+    /// Each page's distance from the first page's top, in points, without
+    /// the gaps between pages: the running sum of page heights. Computed
+    /// once per load, so layouts at any zoom are cheap.
+    page_offsets: []const f64,
 };
 
 pub const Event = union(enum) {
@@ -79,23 +81,20 @@ pub const Status = struct {
 /// What to draw: the visible parts of tiles, the tiles to have ready, and
 /// the status line.
 pub const Frame = struct {
-    slices_buffer: [slices_max]Slice,
-    slices_len: u32,
-    /// Most urgent first: the visible tiles, then those of the next screen
-    /// down, then of the screen above.
-    wanted_buffer: [wanted_max]Tile,
-    wanted_len: u32,
+    tiles: tiling.Tiles,
     status_buffer: [status_len_max]u8,
     status_left_len: u32,
     status_right_len: u32,
     status_keep_end: bool,
 
     pub fn slices(frame: *const Frame) []const Slice {
-        return frame.slices_buffer[0..frame.slices_len];
+        return frame.tiles.slices();
     }
 
+    /// Most urgent first: the visible tiles, then those of the next screen
+    /// down, then of the screen above.
     pub fn wanted(frame: *const Frame) []const Tile {
-        return frame.wanted_buffer[0..frame.wanted_len];
+        return frame.tiles.wanted();
     }
 
     pub fn status(frame: *const Frame) Status {
@@ -133,7 +132,7 @@ pub const State = struct {
         var state: State = .{
             .file_name = file_name,
             .size = size,
-            .document = .{ .generation = 0, .page_sizes = &.{}, .tops = &.{} },
+            .document = .{ .generation = 0, .page_sizes = &.{}, .page_offsets = &.{} },
             .geometry = undefined,
             .anchor = .{ .page = page -| 1, .y = 0 },
             .pan_x = 0,
@@ -163,8 +162,10 @@ pub const State = struct {
                 state.relayout();
             },
             .document => |document| {
-                std.debug.assert(document.tops.len == document.page_sizes.len);
+                std.debug.assert(document.page_offsets.len == document.page_sizes.len);
                 std.debug.assert(document.generation > state.document.generation);
+                // Clears e.g. an earlier "reload failed".
+                state.message_len = 0;
                 state.document = document;
                 state.relayout();
             },
@@ -180,7 +181,7 @@ pub const State = struct {
         tiling.layout(state.geometry, state.anchor, state.pan_x, .{
             .generation = state.document.generation,
             .dark = state.dark,
-        }, frame);
+        }, &frame.tiles);
         state.writeStatus(frame);
     }
 
@@ -219,6 +220,15 @@ pub const State = struct {
         if (pages == 0) return;
         const anchor: Anchor = .{ .page = @intCast(std.math.clamp(page, 0, @as(i64, @intCast(pages - 1)))), .y = 0 };
         state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(anchor));
+        // Keep the page in view horizontally: a narrower page than the last
+        // may lie entirely outside the current pan.
+        const geometry = state.geometry;
+        const width = geometry.pageWidth(anchor.page);
+        const left = (geometry.content_width - width) / 2;
+        state.pan_x = if (width <= geometry.view_width)
+            @min((left + width / 2) -| geometry.view_width / 2, geometry.panMax())
+        else
+            std.math.clamp(state.pan_x, left, left + width - geometry.view_width);
     }
 
     fn setZoom(state: *State, zoom: f32) void {
@@ -235,7 +245,7 @@ pub const State = struct {
     /// Recomputes the geometry after the document, size or zoom changed, and
     /// keeps the position inside the document.
     fn relayout(state: *State) void {
-        state.geometry = .init(state.document.page_sizes, state.document.tops, state.size, state.zoom);
+        state.geometry = .init(state.document.page_sizes, state.document.page_offsets, state.size, state.zoom);
         const pages = state.document.page_sizes.len;
         if (pages == 0) return;
         if (state.anchor.page >= pages) state.anchor = .{ .page = @intCast(pages - 1), .y = 0 };
@@ -344,15 +354,14 @@ test {
 const test_size: terminal.Size = .{ .cols = 80, .rows = 25, .cell_width = 10, .cell_height = 20 };
 /// An 800x480 px view; A4 pages fit to 800 px wide are about 1132 px tall.
 const test_pages: [3]pdf.Size = @splat(.{ .width = 595, .height = 842 });
+const test_offsets = [_]f64{ 0, 842, 2 * 842 };
 
 const TestViewer = struct {
     state: State,
-    tops: [3]i64,
 
-    /// Heap-free but self-referential: `state` points into `tops`.
     fn init(viewer: *TestViewer) void {
         viewer.state = .init("doc.pdf", test_size, false, 1);
-        _ = viewer.state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .tops = &viewer.tops } });
+        _ = viewer.state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .page_offsets = &test_offsets } });
     }
 
     fn feed(viewer: *TestViewer, keys: []const u8) Effect {
@@ -439,8 +448,25 @@ test "a reload keeps the position, clamped to the new page count" {
     var viewer: TestViewer = undefined;
     viewer.init();
     _ = viewer.feed("G");
-    _ = viewer.state.update(.{ .document = .{ .generation = 2, .page_sizes = test_pages[0..1], .tops = viewer.tops[0..1] } });
+    _ = viewer.state.update(.{ .document = .{ .generation = 2, .page_sizes = test_pages[0..1], .page_offsets = test_offsets[0..1] } });
     try std.testing.expectEqual(0, viewer.state.anchor.page);
+}
+
+test "jumping to a narrower page brings it into view" {
+    const pages = [_]pdf.Size{ .{ .width = 2000, .height = 100 }, .{ .width = 200, .height = 100 } };
+    const offsets = [_]f64{ 0, 100 };
+    var state: State = .init("doc.pdf", test_size, false, 1);
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &pages, .page_offsets = &offsets } });
+    // At 800% the narrow page spans 2880..3520 px of 6400; pan to the far
+    // right of the wide page (5600..6400), then jump to the narrow one.
+    for (":zoom 800\r") |byte| _ = state.update(.{ .key = terminal.Key.decode(&.{byte}).?.key });
+    state.pan_x = state.geometry.panMax();
+    _ = state.update(.{ .key = .{ .char = 'l' } });
+    var frame: Frame = undefined;
+    state.layout(&frame);
+    for (frame.slices()) |slice| {
+        if (slice.tile.page == 1) break;
+    } else return error.TestUnexpectedResult;
 }
 
 test "status line" {
@@ -448,7 +474,7 @@ test "status line" {
     var state: State = .init("doc.pdf", test_size, false, 1);
     state.layout(&frame);
     try std.testing.expectEqualStrings("loading...", frame.status().right);
-    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &.{}, .tops = &.{} } });
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &.{}, .page_offsets = &.{} } });
     state.layout(&frame);
     try std.testing.expectEqualStrings("no pages", frame.status().right);
     // Messages still show without pages.
@@ -468,8 +494,7 @@ test "a window with no room for pages draws nothing and doesn't crash" {
 }
 
 test "the first page applies once the document arrives" {
-    var tops: [3]i64 = undefined;
     var state: State = .init("doc.pdf", test_size, false, 3);
-    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .tops = &tops } });
+    _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .page_offsets = &test_offsets } });
     try std.testing.expectEqual(2, state.anchor.page);
 }
