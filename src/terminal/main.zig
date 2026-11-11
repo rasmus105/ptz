@@ -12,6 +12,9 @@
 // std
 const std = @import("std");
 
+// local
+pub const Key = @import("key.zig").Key;
+
 // aliases
 const posix = std.posix;
 
@@ -143,4 +146,12 @@ pub fn query(input: *std.Io.Reader, output: *std.Io.Writer, comptime request: []
             error.ReadFailed => error.Unexpected,
         };
     }
+}
+
+// ====================================================================================================
+// Tests
+// ====================================================================================================
+
+test {
+    _ = Key;
 }
