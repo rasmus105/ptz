@@ -2,8 +2,8 @@ name: Release
 
 # Pushing a tag `vX.Y.Z` that matches the version in build.zig.zon builds the
 # release archives, publishes a GitHub release, and updates the Homebrew tap
-# (which needs a `HOMEBREW_TAP_TOKEN` secret that can push to
-# rasmus105/homebrew-tap).
+# (which needs a `TAP_DEPLOY_KEY` secret holding the private half of a write
+# deploy key on rasmus105/homebrew-tap).
 on:
   push:
     tags: ["v*"]
@@ -56,10 +56,14 @@ jobs:
         run: gh release create "$GITHUB_REF_NAME" ptz-*.tar.gz --generate-notes
       - name: Update Homebrew tap
         env:
-          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          TAP_DEPLOY_KEY: ${{ secrets.TAP_DEPLOY_KEY }}
         run: |
           version=${GITHUB_REF_NAME#v}
-          git clone "https://x-access-token:${TAP_TOKEN}@github.com/rasmus105/homebrew-tap.git" tap
+          key="$RUNNER_TEMP/tap_key"
+          printf '%s\n' "$TAP_DEPLOY_KEY" > "$key"
+          chmod 600 "$key"
+          export GIT_SSH_COMMAND="ssh -i $key -o IdentitiesOnly=yes"
+          git clone git@github.com:rasmus105/homebrew-tap.git tap
           sed -e "s/@VERSION@/$version/g" \
               -e "s/@SHA256_AARCH64_MACOS@/$(sha256sum ptz-$version-aarch64-macos.tar.gz | cut -d' ' -f1)/" \
               -e "s/@SHA256_X86_64_LINUX@/$(sha256sum ptz-$version-x86_64-linux.tar.gz | cut -d' ' -f1)/" \

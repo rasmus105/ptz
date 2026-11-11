@@ -3,7 +3,6 @@
 class Ptz < Formula
   desc "Render PDFs in the terminal"
   homepage "https://github.com/rasmus105/ptz"
-  version "@VERSION@"
   license "MIT"
 
   on_macos do
@@ -21,9 +20,10 @@ class Ptz < Formula
   end
 
   def install
-    # ptz finds PDFium in ../lib relative to itself.
-    bin.install "bin/ptz"
-    lib.install Dir["lib/*"]
+    # ptz finds PDFium in ../lib relative to itself; libexec keeps PDFium out
+    # of the shared Homebrew lib/ directory.
+    libexec.install "bin", "lib"
+    bin.install_symlink libexec/"bin/ptz"
   end
 
   test do
