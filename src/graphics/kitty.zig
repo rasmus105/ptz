@@ -25,9 +25,8 @@ const support_query = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 // Public API
 // ====================================================================================================
 
-pub fn supported(io: std.Io) terminal.Error!bool {
-    var buffer: [256]u8 = undefined;
-    const reply = try terminal.query(io, support_query, &buffer);
+pub fn supported(input: *std.Io.Reader, output: *std.Io.Writer) terminal.Error!bool {
+    const reply = try terminal.query(input, output, support_query);
     return std.mem.indexOf(u8, reply, "\x1b_Gi=31;OK") != null;
 }
 
@@ -35,8 +34,10 @@ pub fn supported(io: std.Io) terminal.Error!bool {
 /// (`o=z`) RGBA (`f=32`), split into chunks where all but the last carry
 /// `m=1`. Pages are mostly uniform background, so compression shrinks what
 /// the terminal has to receive and decode many times over, which dominates
-/// display time. `q=2` stops the terminal from replying, since nothing reads
-/// replies at this point and they would otherwise show up as typed input.
+/// display time. `C=1` leaves the cursor where it is, since terminals differ
+/// in where they move it after an image that spans the full width. `q=2`
+/// stops the terminal from replying, since nothing reads replies at this
+/// point and they would otherwise show up as typed input.
 pub fn draw(gpa: std.mem.Allocator, writer: *std.Io.Writer, image: graphics.Image) !void {
     var compressed: std.Io.Writer.Allocating = try .initCapacity(gpa, image.pixels.len / 16 + 64);
     defer compressed.deinit();
@@ -53,7 +54,7 @@ pub fn draw(gpa: std.mem.Allocator, writer: *std.Io.Writer, image: graphics.Imag
         rest = rest[chunk.len..];
         const more = @intFromBool(rest.len > 0);
         if (first) {
-            try writer.print("\x1b_Ga=T,f=32,o=z,s={d},v={d},q=2,m={d};", .{ image.width, image.height, more });
+            try writer.print("\x1b_Ga=T,f=32,o=z,s={d},v={d},C=1,q=2,m={d};", .{ image.width, image.height, more });
         } else {
             try writer.print("\x1b_Gm={d};", .{more});
         }
@@ -104,7 +105,7 @@ test "small image is sent as a single escape sequence" {
 
     const keys, const received = try expectTransmission(gpa, output.written(), 1);
     defer gpa.free(received);
-    try std.testing.expectEqualStrings("a=T,f=32,o=z,s=1,v=1,q=2,m=0", keys);
+    try std.testing.expectEqualStrings("a=T,f=32,o=z,s=1,v=1,C=1,q=2,m=0", keys);
     try std.testing.expectEqualSlices(u8, &pixels, received);
 }
 
@@ -124,4 +125,12 @@ test "large image is split into chunks that reassemble to the pixels" {
     _, const received = try expectTransmission(gpa, output.written(), sequences);
     defer gpa.free(received);
     try std.testing.expectEqualSlices(u8, &pixels, received);
+}
+
+test "kitty graphics support is detected" {
+    const gpa = std.testing.allocator;
+    const Emulator = @import("../emulator/main.zig").Emulator;
+    const emulator: *Emulator = try .create(std.testing.io, gpa, .{ .cols = 80, .rows = 24, .cell_width = 10, .cell_height = 20 });
+    defer emulator.destroy();
+    try std.testing.expect(try supported(&emulator.input, &emulator.output));
 }

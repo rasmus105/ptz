@@ -60,3 +60,18 @@ empty ones:
 // Types
 // ====================================================================================================
 ```
+
+## Testing
+
+- `zig build test` runs all tests. Fixtures are opened relative to the
+  project root.
+- Code that talks to the terminal takes its input and output as streams
+  (`*std.Io.Reader`, `*std.Io.Writer`), never stdin/stdout directly, so tests
+  can run it against `src/emulator/main.zig`, an emulated terminal built on
+  Ghostty's `ghostty-vt`. Only tests and the harness may import it.
+- To see what ptz draws, run `zig build harness -- <file.pdf> [--page N]`.
+  It prints the emulated screen's text and writes a screenshot of its images
+  to `zig-out/screen.png`.
+- For behaviour that needs a real terminal (raw mode, resizing, detection in
+  an actual emulator), run ptz in a background Rex tab and read it with
+  `rex capture`; Rex captures text only.

@@ -28,12 +28,12 @@ pub const Image = struct {
 // ====================================================================================================
 
 /// Whether the terminal can display images, by asking it directly.
-pub fn supported(io: std.Io) terminal.Error!bool {
-    return kitty.supported(io);
+pub fn supported(input: *std.Io.Reader, output: *std.Io.Writer) terminal.Error!bool {
+    return kitty.supported(input, output);
 }
 
-/// Draws `image` at the cursor at its native pixel size. The terminal moves
-/// the cursor past the image afterwards.
+/// Draws `image` with its top left corner at the cursor, at its native pixel
+/// size. The cursor does not move.
 pub fn draw(gpa: std.mem.Allocator, writer: *std.Io.Writer, image: Image) !void {
     try kitty.draw(gpa, writer, image);
 }

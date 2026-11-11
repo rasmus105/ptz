@@ -15,14 +15,6 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", @import("build.zig.zon").version);
 
-    const root_module = b.createModule(.{
-        .root_source_file = b.path("src/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    root_module.addOptions("build_options", build_options);
-
     // PDFium ships only as a shared library. It is installed to lib/ next to
     // bin/, and the executable finds it relative to itself.
     const pdfium_dep_name: []const u8 = if (os == .macos and arch == .aarch64)
@@ -32,20 +24,24 @@ pub fn build(b: *std.Build) void {
     else
         std.debug.panic("ptz: no PDFium build configured for {t}-{t}", .{ arch, os });
     const pdfium_lib_name = if (os == .macos) "libpdfium.dylib" else "libpdfium.so";
-    root_module.addRPathSpecial(if (os == .macos) "@executable_path/../lib" else "$ORIGIN/../lib");
-    // Null on the first configure pass while the archive is being fetched.
-    if (b.lazyDependency(pdfium_dep_name, .{})) |pdfium| {
-        root_module.addLibraryPath(pdfium.path("lib"));
-        root_module.linkSystemLibrary("pdfium", .{ .use_pkg_config = .no });
-        const lib = pdfium.path(b.fmt("lib/{s}", .{pdfium_lib_name}));
-        b.getInstallStep().dependOn(&b.addInstallLibFile(lib, pdfium_lib_name).step);
-    }
+    // Both are null on the first configure pass while they are being fetched.
+    const pdfium = b.lazyDependency(pdfium_dep_name, .{});
+    const ghostty = b.lazyDependency("ghostty", .{});
 
-    const exe = b.addExecutable(.{ .name = "ptz", .root_module = root_module });
-    // Keep the fetch location out of shipped binaries; tests keep the
-    // default so they load PDFium from where it was fetched.
+    // The executable, tests and harness share sources but get separate root
+    // modules, so only tests and the harness link Ghostty.
+    const exe_module = createModule(b, target, optimize, "src/main.zig", pdfium);
+    exe_module.addOptions("build_options", build_options);
+    exe_module.addRPathSpecial(if (os == .macos) "@executable_path/../lib" else "$ORIGIN/../lib");
+    const exe = b.addExecutable(.{ .name = "ptz", .root_module = exe_module });
+    // Keep the fetch location out of shipped binaries; tests and the harness
+    // keep the default so they load PDFium from where it was fetched.
     exe.each_lib_rpath = false;
     b.installArtifact(exe);
+    if (pdfium) |dep| {
+        const lib = dep.path(b.fmt("lib/{s}", .{pdfium_lib_name}));
+        b.getInstallStep().dependOn(&b.addInstallLibFile(lib, pdfium_lib_name).step);
+    }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -53,9 +49,43 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run ptz");
     run_step.dependOn(&run_cmd.step);
 
-    const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = root_module }));
+    const test_module = createModule(b, target, optimize, "src/main.zig", pdfium);
+    test_module.addOptions("build_options", build_options);
+    if (ghostty) |dep| test_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    const run_tests = b.addRunArtifact(b.addTest(.{ .root_module = test_module }));
     // Test fixtures are opened by paths relative to the project root.
     run_tests.setCwd(b.path("."));
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&run_tests.step);
+
+    const harness_module = createModule(b, target, optimize, "src/harness.zig", pdfium);
+    if (ghostty) |dep| harness_module.addImport("ghostty-vt", dep.module("ghostty-vt"));
+    const run_harness = b.addRunArtifact(b.addExecutable(.{ .name = "harness", .root_module = harness_module }));
+    run_harness.addPassthruArgs();
+    const harness_step = b.step("harness", "Show a page in an emulated terminal and capture the screen");
+    harness_step.dependOn(&run_harness.step);
+}
+
+// ====================================================================================================
+// Private Functions
+// ====================================================================================================
+
+fn createModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    root: []const u8,
+    pdfium: ?*std.Build.Dependency,
+) *std.Build.Module {
+    const module = b.createModule(.{
+        .root_source_file = b.path(root),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    if (pdfium) |dep| {
+        module.addLibraryPath(dep.path("lib"));
+        module.linkSystemLibrary("pdfium", .{ .use_pkg_config = .no });
+    }
+    return module;
 }
