@@ -24,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("argparse.zig");
+    _ = @import("graphics/main.zig");
     _ = @import("pdf/main.zig");
     _ = @import("terminal/main.zig");
 }
