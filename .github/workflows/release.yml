@@ -1,0 +1,72 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` that matches the version in build.zig.zon builds the
+# release archives, publishes a GitHub release, and updates the Homebrew tap
+# (which needs a `HOMEBREW_TAP_TOKEN` secret that can push to
+# rasmus105/homebrew-tap).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-macos
+          - os: ubuntu-latest
+            target: x86_64-linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - name: Check tag matches version
+        run: |
+          version=$(sed -n 's/^ *\.version = "\(.*\)",/\1/p' build.zig.zon)
+          test "v$version" = "$GITHUB_REF_NAME"
+      - run: zig build test
+      - run: zig build -Doptimize=ReleaseFast --prefix "ptz-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+      - name: Package
+        run: |
+          dir="ptz-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          cp LICENSE README.md "$dir/"
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ptz-*.tar.gz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" ptz-*.tar.gz --generate-notes
+      - name: Update Homebrew tap
+        env:
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/rasmus105/homebrew-tap.git" tap
+          sed -e "s/@VERSION@/$version/g" \
+              -e "s/@SHA256_AARCH64_MACOS@/$(sha256sum ptz-$version-aarch64-macos.tar.gz | cut -d' ' -f1)/" \
+              -e "s/@SHA256_X86_64_LINUX@/$(sha256sum ptz-$version-x86_64-linux.tar.gz | cut -d' ' -f1)/" \
+              packaging/ptz.rb > tap/Formula/ptz.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/ptz.rb
+          git commit -m "ptz $version"
+          git push

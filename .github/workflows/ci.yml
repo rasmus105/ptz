@@ -1,0 +1,24 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        # The platforms ptz ships PDFium builds for (see build.zig.zon).
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.17.1
+      - run: zig fmt --check src build.zig build.zig.zon
+      - run: zig build test --summary all
+      - run: zig build -Doptimize=ReleaseFast
+      - run: zig-out/bin/ptz --version
