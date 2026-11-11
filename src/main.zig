@@ -38,6 +38,16 @@ pub fn main(init: std.process.Init) !void {
         error.NotATerminal => fatal("output is not a terminal", .{}),
         else => fatal("cannot determine the terminal size: {t}", .{err}),
     };
+    if (options.protocol == .auto) {
+        const supported = graphics.supported(io) catch |err| switch (err) {
+            error.NoReply => false,
+            else => fatal("cannot query the terminal: {t}", .{err}),
+        };
+        if (!supported) fatal(
+            "terminal does not support the kitty graphics protocol (use --protocol kitty to try anyway)",
+            .{},
+        );
+    }
 
     // Fit the page to the window, leaving the last row for the prompt.
     const page_size = try doc.pageSize(page);

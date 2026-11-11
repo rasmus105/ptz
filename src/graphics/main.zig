@@ -6,6 +6,9 @@
 // std
 const std = @import("std");
 
+// project
+const terminal = @import("../terminal/main.zig");
+
 // local
 const kitty = @import("kitty.zig");
 
@@ -23,6 +26,11 @@ pub const Image = struct {
 // ====================================================================================================
 // Public API
 // ====================================================================================================
+
+/// Whether the terminal can display images, by asking it directly.
+pub fn supported(io: std.Io) terminal.Error!bool {
+    return kitty.supported(io);
+}
 
 /// Draws `image` at the cursor at its native pixel size. The terminal moves
 /// the cursor past the image afterwards.

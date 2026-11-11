@@ -3,6 +3,9 @@
 // std
 const std = @import("std");
 
+// project
+const terminal = @import("../terminal/main.zig");
+
 // local
 const graphics = @import("main.zig");
 
@@ -14,9 +17,19 @@ const graphics = @import("main.zig");
 /// 3072 raw bytes encode to exactly that.
 const chunk_len = 3072;
 
+/// Asks the terminal to check a 1x1 RGB image (`a=q`) without storing or
+/// displaying it. Kitty-capable terminals reply `OK` for image id 31.
+const support_query = "\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
+
 // ====================================================================================================
 // Public API
 // ====================================================================================================
+
+pub fn supported(io: std.Io) terminal.Error!bool {
+    var buffer: [256]u8 = undefined;
+    const reply = try terminal.query(io, support_query, &buffer);
+    return std.mem.indexOf(u8, reply, "\x1b_Gi=31;OK") != null;
+}
 
 /// Transmits and displays `image` in one go (`a=T`) as raw RGBA (`f=32`),
 /// split into chunks where all but the last carry `m=1`. `q=2` stops the
