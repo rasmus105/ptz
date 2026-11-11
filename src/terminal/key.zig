@@ -107,9 +107,9 @@ fn expectKeys(input: []const u8, expected: []const Key) !void {
 }
 
 test "plain, control and multi-byte keys" {
-    try expectKeys("j\x04\x15:é\r\x7f", &.{
+    try expectKeys("j\x04\x15:\xc3\xa9\r\x7f", &.{
         .{ .char = 'j' }, .{ .ctrl = 'd' }, .{ .ctrl = 'u' }, .{ .char = ':' },
-        .{ .char = 'é' },
+        .{ .char = 0xe9 },
         .enter,           .backspace,
     });
 }

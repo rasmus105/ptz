@@ -34,18 +34,16 @@ pub const Emulator = struct {
     output_buffer: [4096]u8,
     input_buffer: [1024]u8,
 
-    /// An image on screen, as the terminal would draw it.
-    pub const Image = struct {
-        /// Cell of the image's top left corner.
-        col: u32,
-        row: u32,
+    /// The screen's pixels: placed images over a dark background. Text is
+    /// not drawn; read it with `text`.
+    pub const Screenshot = struct {
         width: u32,
         height: u32,
-        /// RGBA, owned by the emulator.
-        pixels: []const u8,
+        /// RGBA, owned by the caller.
+        pixels: []u8,
 
-        pub fn pixel(image: Image, x: u32, y: u32) [4]u8 {
-            return image.pixels[(@as(usize, y) * image.width + x) * 4 ..][0..4].*;
+        pub fn pixel(shot: Screenshot, x: u32, y: u32) [4]u8 {
+            return shot.pixels[(@as(usize, y) * shot.width + x) * 4 ..][0..4].*;
         }
     };
 
@@ -99,36 +97,42 @@ pub const Emulator = struct {
         return emulator.terminal.plainString(gpa);
     }
 
-    /// Images on screen, in no particular order. Caller owns the slice; the
-    /// pixels stay owned by the emulator.
-    pub fn images(emulator: *Emulator, gpa: std.mem.Allocator) ![]Image {
-        const screen = emulator.terminal.screens.active;
-        var result: std.ArrayList(Image) = .empty;
-        errdefer result.deinit(gpa);
+    pub fn screenshot(emulator: *Emulator, gpa: std.mem.Allocator) !Screenshot {
+        const size = emulator.size;
+        const width = @as(u32, size.cols) * size.cell_width;
+        const height = @as(u32, size.rows) * size.cell_height;
+        const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
+        for (0..pixels.len / 4) |i| pixels[i * 4 ..][0..4].* = .{ 32, 32, 32, 255 };
 
+        const screen = emulator.terminal.screens.active;
         var placements = screen.kitty_images.placements.iterator();
         while (placements.next()) |entry| {
-            const pin = switch (entry.value_ptr.location) {
+            const placement = entry.value_ptr;
+            const pin = switch (placement.location) {
                 .pin => |pin| pin,
                 else => continue,
             };
             const point = screen.pages.pointFromPin(.active, pin.*) orelse continue;
             const image = screen.kitty_images.imageById(entry.key_ptr.image_id) orelse continue;
-            const pixels = switch (image.data) {
+            const data = switch (image.data) {
                 .complete => |data| data,
                 .pending => continue,
             };
             // ptz only sends RGBA, which the terminal stores as is.
             std.debug.assert(image.format == .rgba);
-            try result.append(gpa, .{
-                .col = point.active.x,
-                .row = point.active.y,
-                .width = image.width,
-                .height = image.height,
-                .pixels = pixels,
-            });
+
+            // A zero source size means the rest of the image.
+            const source_width = if (placement.source_width == 0) image.width - placement.source_x else placement.source_width;
+            const source_height = if (placement.source_height == 0) image.height - placement.source_y else placement.source_height;
+            const left = point.active.x * size.cell_width + placement.x_offset;
+            const top = point.active.y * size.cell_height + placement.y_offset;
+            const columns = @min(source_width, width -| left);
+            for (0..@min(source_height, height -| top)) |row| {
+                const source = data[((placement.source_y + row) * image.width + placement.source_x) * 4 ..][0 .. columns * 4];
+                @memcpy(pixels[((top + row) * width + left) * 4 ..][0 .. columns * 4], source);
+            }
         }
-        return result.toOwnedSlice(gpa);
+        return .{ .width = width, .height = height, .pixels = pixels };
     }
 
     fn drain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {

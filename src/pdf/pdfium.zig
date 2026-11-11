@@ -51,7 +51,7 @@ pub const Err = enum(c_ulong) {
 pub extern fn FPDF_InitLibrary() void;
 pub extern fn FPDF_GetLastError() Err;
 
-pub extern fn FPDF_LoadDocument(file_path: [*:0]const u8, password: ?[*:0]const u8) ?*FPDF_DOCUMENT;
+pub extern fn FPDF_LoadMemDocument64(data_buf: *const anyopaque, size: usize, password: ?[*:0]const u8) ?*FPDF_DOCUMENT;
 pub extern fn FPDF_CloseDocument(document: *FPDF_DOCUMENT) void;
 pub extern fn FPDF_GetPageCount(document: *FPDF_DOCUMENT) c_int;
 pub extern fn FPDF_GetPageSizeByIndexF(document: *FPDF_DOCUMENT, page_index: c_int, size: *FS_SIZEF) FPDF_BOOL;

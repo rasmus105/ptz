@@ -1,12 +1,21 @@
 // std
 const std = @import("std");
 
+// project
+const app = @import("app/main.zig");
+const graphics = @import("graphics/main.zig");
+const terminal = @import("terminal/main.zig");
+
 // local
 const cli = @import("cli.zig");
-const graphics = @import("graphics/main.zig");
-const pdf = @import("pdf/main.zig");
-const terminal = @import("terminal/main.zig");
-const viewer = @import("viewer/main.zig");
+
+// ====================================================================================================
+// Constants
+// ====================================================================================================
+
+/// Restores the terminal before reporting a panic, so the message isn't lost
+/// on the alternate screen and the shell isn't left in raw mode.
+pub const panic = std.debug.FullPanic(panicRestoringTerminal);
 
 // ====================================================================================================
 // Public API
@@ -14,55 +23,62 @@ const viewer = @import("viewer/main.zig");
 
 pub fn main(init: std.process.Init) !void {
     const io = init.io;
-    const gpa = init.gpa;
     const options = try cli.parse(init);
-    const fatal = std.process.fatal;
 
-    const path = try init.arena.allocator().dupeSentinel(u8, options.file, 0);
-    const doc = pdf.Document.open(io, path, null) catch |err| fatal("cannot open '{s}': {s}", .{
-        options.file,
-        switch (err) {
-            error.FileNotFound => "file not found",
-            error.InvalidFormat => "not a PDF file, or corrupted",
-            error.PasswordRequired => "password protected",
-            error.UnsupportedSecurity => "unsupported encryption",
-            error.PageNotFound, error.Unexpected => "unexpected error",
-        },
-    });
-    defer doc.close();
-
-    const page_count = doc.pageCount();
-    if (options.page == 0 or options.page > page_count)
-        fatal("page {d} is out of range, '{s}' has {d} pages", .{ options.page, options.file, page_count });
-    const page = options.page - 1;
-
-    var stdout_buffer: [64 * 1024]u8 = undefined;
+    // Large enough that a typical tile upload goes out in a few writes.
+    var stdout_buffer: [256 * 1024]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
+
+    const raw = terminal.RawMode.enter() catch std.process.fatal("input is not a terminal", .{});
+    defer raw.restore();
+
     var input_buffer: [1024]u8 = undefined;
     var input: terminal.Input = .init(&input_buffer, 1000);
-
-    // Results are checked after leaving raw mode, since `fatal` exits
-    // without running defers.
-    const raw = terminal.RawMode.enter() catch fatal("input is not a terminal", .{});
-    const size_result = terminal.size(&input.interface, stdout);
-    const supported_result = if (options.protocol == .auto) graphics.supported(&input.interface, stdout) else true;
-    raw.restore();
-
-    const size = size_result catch |err| switch (err) {
-        error.NotATerminal => fatal("output is not a terminal", .{}),
-        else => fatal("cannot determine the terminal size: {t}", .{err}),
+    const size = terminal.size(&input.interface, stdout) catch |err| switch (err) {
+        error.NotATerminal => fail("output is not a terminal", .{}),
+        else => fail("cannot determine the terminal size: {t}", .{err}),
     };
-    const supported = supported_result catch |err| switch (err) {
-        error.NoReply => false,
-        else => fatal("cannot query the terminal: {t}", .{err}),
-    };
-    if (!supported) fatal(
-        "terminal does not support the kitty graphics protocol (use --protocol kitty to try anyway)",
-        .{},
-    );
+    if (options.protocol == .auto) {
+        const supported = graphics.supported(&input.interface, stdout) catch |err| switch (err) {
+            error.NoReply => false,
+            else => fail("cannot query the terminal: {t}", .{err}),
+        };
+        if (!supported) fail(
+            "terminal does not support the kitty graphics protocol (use --protocol kitty to try anyway)",
+            .{},
+        );
+    }
 
-    try viewer.showPage(gpa, stdout, doc, page, size);
+    app.run(io, init.gpa, .{
+        .path = options.file,
+        .page = options.page,
+        .dark = options.dark,
+        .watch = options.watch,
+    }, size, stdout) catch |err| switch (err) {
+        error.FileNotFound => fail("cannot open '{s}': file not found", .{options.file}),
+        error.AccessDenied => fail("cannot open '{s}': permission denied", .{options.file}),
+        error.FileTooBig => fail("cannot open '{s}': file too big", .{options.file}),
+        error.InvalidFormat => fail("cannot open '{s}': not a PDF file, or corrupted", .{options.file}),
+        error.PasswordRequired => fail("cannot open '{s}': password protected", .{options.file}),
+        error.UnsupportedSecurity => fail("cannot open '{s}': unsupported encryption", .{options.file}),
+        else => return err,
+    };
+}
+
+// ====================================================================================================
+// Private Functions
+// ====================================================================================================
+
+/// `std.process.fatal`, after leaving raw mode, which `fatal` would skip.
+fn fail(comptime format: []const u8, args: anytype) noreturn {
+    terminal.restoreAfterCrash();
+    std.process.fatal(format, args);
+}
+
+fn panicRestoringTerminal(message: []const u8, first_trace_address: ?usize) noreturn {
+    terminal.restoreAfterCrash();
+    std.debug.defaultPanic(message, first_trace_address);
 }
 
 // ====================================================================================================
@@ -71,8 +87,9 @@ pub fn main(init: std.process.Init) !void {
 
 test {
     _ = @import("argparse.zig");
+    _ = app;
     _ = graphics;
-    _ = pdf;
+    _ = @import("pdf/main.zig");
     _ = terminal;
-    _ = viewer;
+    _ = @import("viewer/main.zig");
 }

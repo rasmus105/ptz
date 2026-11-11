@@ -24,6 +24,16 @@ const posix = std.posix;
 
 const da1_request = "\x1b[c";
 
+/// Switches to the alternate screen and hides the cursor, and back.
+pub const fullscreen_enter = "\x1b[?1049h\x1b[?25l";
+pub const fullscreen_leave = "\x1b[?25h\x1b[?1049l";
+
+/// Synchronized output (mode 2026): the terminal shows everything between
+/// begin and end at once, so redraws don't flicker. Terminals without it
+/// ignore it.
+pub const sync_begin = "\x1b[?2026h";
+pub const sync_end = "\x1b[?2026l";
+
 // ====================================================================================================
 // Types
 // ====================================================================================================
@@ -45,7 +55,8 @@ pub const Size = struct {
 };
 
 /// Puts stdin in raw mode until `restore`, so key presses and query replies
-/// arrive byte by byte without being echoed.
+/// arrive byte by byte without being echoed, and Ctrl-C, Ctrl-Z and Ctrl-S
+/// arrive as keys instead of signals or flow control.
 pub const RawMode = struct {
     original: posix.termios,
 
@@ -54,14 +65,20 @@ pub const RawMode = struct {
         var raw = original;
         raw.lflag.ICANON = false;
         raw.lflag.ECHO = false;
+        raw.lflag.ISIG = false;
+        raw.lflag.IEXTEN = false;
+        raw.iflag.IXON = false;
+        raw.iflag.ICRNL = false;
         raw.cc[@backingInt(posix.V.MIN)] = 0;
         raw.cc[@backingInt(posix.V.TIME)] = 0;
         posix.tcsetattr(posix.STDIN_FILENO, .NOW, raw) catch return error.NotATerminal;
+        crash_restore = original;
         return .{ .original = original };
     }
 
     pub fn restore(mode: RawMode) void {
         posix.tcsetattr(posix.STDIN_FILENO, .NOW, mode.original) catch {};
+        crash_restore = null;
     }
 };
 
@@ -92,8 +109,39 @@ pub const Input = struct {
 };
 
 // ====================================================================================================
+// Fields
+// ====================================================================================================
+
+/// The settings to restore if the process dies in raw mode.
+var crash_restore: ?posix.termios = null;
+/// Written to on SIGWINCH; see `notifyOnResize`.
+var resize_fd: posix.fd_t = -1;
+
+// ====================================================================================================
 // Public API
 // ====================================================================================================
+
+/// Puts the terminal back as it was before raw mode and full screen, for
+/// paths that skip normal cleanup: panics and `std.process.fatal`.
+pub fn restoreAfterCrash() void {
+    const original = crash_restore orelse return;
+    const reset = sync_end ++ fullscreen_leave;
+    _ = std.c.write(posix.STDOUT_FILENO, reset, reset.len);
+    posix.tcsetattr(posix.STDIN_FILENO, .NOW, original) catch {};
+    crash_restore = null;
+}
+
+/// Writes a byte to `fd` whenever the window is resized, so an event loop
+/// polling `fd` wakes up.
+pub fn notifyOnResize(fd: posix.fd_t) void {
+    resize_fd = fd;
+    const action: posix.Sigaction = .{
+        .handler = .{ .handler = onResize },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.RESTART,
+    };
+    posix.sigaction(.WINCH, &action, null);
+}
 
 /// Window size from the kernel, falling back to asking the terminal for the
 /// cell size when the kernel doesn't know it.
@@ -146,6 +194,14 @@ pub fn query(input: *std.Io.Reader, output: *std.Io.Writer, comptime request: []
             error.ReadFailed => error.Unexpected,
         };
     }
+}
+
+// ====================================================================================================
+// Private Functions
+// ====================================================================================================
+
+fn onResize(_: posix.SIG) callconv(.c) void {
+    _ = std.c.write(resize_fd, "r", 1);
 }
 
 // ====================================================================================================
