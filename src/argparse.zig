@@ -16,7 +16,8 @@
 //!
 //!     const options = try Cli(Options, .{ .name = "ptz", ... }).parse(init);
 //!
-//! Field `foo_bar` becomes `--foo-bar`. Fields without a default are required.
+//! Field `foo_bar` becomes `--foo-bar`, or `--no-foo-bar` for a bool that
+//! defaults to true. Fields without a default are required.
 //! `-h`/`--help` and `--version` are built in. Inconsistent metadata (missing
 //! help, unknown keys, duplicate shorts) is a compile error.
 
@@ -302,14 +303,18 @@ fn fieldSpecs(comptime Options: type) [@typeInfo(Options).@"struct".field_names.
             var long: [name.len]u8 = name[0..name.len].*;
             std.mem.replaceScalar(u8, &long, '_', '-');
             const long_final = long;
+            if (T == bool and default == null)
+                @compileError("argparse: bool option '" ++ name ++ "' needs a default");
+            // A bool that defaults to true can only be switched off.
+            const prefix = if (T == bool and default.? == true) "--no-" else "--";
 
             spec.* = .{
-                .long = "--" ++ &long_final,
+                .long = prefix ++ &long_final,
                 .short = if (@hasField(@TypeOf(shorts), name)) @field(shorts, name) else null,
                 .positional_order = order,
                 .is_bool = T == bool,
                 .required = default == null,
-                .display = if (order != null) "<" ++ name ++ ">" else "--" ++ &long_final,
+                .display = if (order != null) "<" ++ name ++ ">" else prefix ++ &long_final,
                 .value_hint = valueHint(T),
                 .help = if (order != null)
                     @field(positional, name)
@@ -398,10 +403,11 @@ fn setField(
     diag: *Diagnostic,
 ) error{InvalidValue}!void {
     const info = @typeInfo(Options).@"struct";
-    inline for (info.field_names, info.field_types, 0..) |name, T, i| {
+    inline for (info.field_names, info.field_types, info.field_attrs, 0..) |name, T, attrs, i| {
         if (i == index) {
             if (T == bool) {
-                @field(options, name) = true;
+                // Giving the flag flips the default: `--watch` or `--no-watch`.
+                @field(options, name) = !attrs.defaultValue(bool).?;
             } else {
                 @field(options, name) = parseValue(T, text) catch {
                     diag.* = .{
@@ -492,6 +498,7 @@ const TestCli = Cli(struct {
     mode: enum { light, dark } = .light,
     watch: bool = false,
     zoom_level: ?f32 = null,
+    color: bool = true,
 
     pub const positional = .{ .file = "File to open" };
     pub const shorts = .{ .page = 'p', .watch = 'w' };
@@ -500,6 +507,7 @@ const TestCli = Cli(struct {
         .mode = "Colour mode",
         .watch = "Reload on change",
         .zoom_level = "Initial zoom",
+        .color = "Disable colour",
     };
 }, .{
     .name = "tool",
@@ -530,8 +538,10 @@ test "defaults apply and every value syntax is accepted" {
         try std.testing.expectEqual(7, (try TestCli.parseArgs(args, &diag)).page);
     }
 
-    const all = try TestCli.parseArgs(&.{ "-w", "--mode", "dark", "--zoom-level=1.5", "a.pdf" }, &diag);
+    try std.testing.expect(defaults.color);
+    const all = try TestCli.parseArgs(&.{ "-w", "--mode", "dark", "--zoom-level=1.5", "--no-color", "a.pdf" }, &diag);
     try std.testing.expect(all.watch);
+    try std.testing.expect(!all.color);
     try std.testing.expectEqual(.dark, all.mode);
     try std.testing.expectEqual(1.5, all.zoom_level.?);
 }
@@ -553,6 +563,7 @@ test "errors name the offending argument" {
     try expectStop(error.UnknownOption, "-wx", &.{ "-wx", "a.pdf" });
     try expectStop(error.MissingValue, "--page", &.{ "a.pdf", "--page" });
     try expectStop(error.UnexpectedValue, "--watch", &.{ "--watch=yes", "a.pdf" });
+    try expectStop(error.UnknownOption, "--color", &.{ "--color", "a.pdf" });
     try expectStop(error.InvalidValue, "--page", &.{ "--page", "x", "a.pdf" });
     try expectStop(error.InvalidValue, "--mode", &.{ "--mode", "sepia", "a.pdf" });
     try expectStop(error.MissingArgument, "<file>", &.{ "-p", "2" });
@@ -578,6 +589,7 @@ test "help page aligns all rows and shows defaults" {
         \\      --mode <light|dark>  Colour mode (default: light)
         \\  -w, --watch              Reload on change
         \\      --zoom-level <X>     Initial zoom
+        \\      --no-color           Disable colour
         \\  -h, --help               Show this help
         \\      --version            Show version
         \\
