@@ -2,6 +2,15 @@
 
 Terminal PDF viewer written in Zig 0.17.
 
+## Architecture
+
+- `viewer/`: the viewer's logic, pure and deterministic: keys and events in,
+  frames (which tile slices go where, which tiles to render) out.
+- `app/`: the I/O shell: event loop, render thread (`Renderer`), the tiles
+  uploaded to the terminal (`Cache`).
+- `pdf/`, `graphics/`, `terminal/`: engine-neutral wrappers around PDFium, the
+  kitty graphics protocol and the terminal.
+
 ## Code style
 
 ### Imports
@@ -69,9 +78,10 @@ empty ones:
   (`*std.Io.Reader`, `*std.Io.Writer`), never stdin/stdout directly, so tests
   can run it against `src/emulator/main.zig`, an emulated terminal built on
   Ghostty's `ghostty-vt`. Only tests and the harness may import it.
-- To see what ptz draws, run `zig build harness -- <file.pdf> [--page N]`.
-  It prints the emulated screen's text and writes a screenshot of its images
-  to `zig-out/screen.png`.
+- To see what ptz draws, run
+  `zig build harness -Doptimize=ReleaseFast -- <file.pdf> --keys '3G<C-d>+'`.
+  It runs the viewer in the emulated terminal, presses the keys, prints the
+  screen's text and writes a screenshot of its images to `zig-out/screen.png`.
 - For behaviour that needs a real terminal (raw mode, resizing, detection in
   an actual emulator), run ptz in a background Rex tab and read it with
   `rex capture`; Rex captures text only.
