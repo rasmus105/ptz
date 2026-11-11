@@ -262,12 +262,16 @@ const Watch = struct {
         return .{ .path = path, .loaded = stamp(io, path), .pending = null, .checked = .now(io, .awake) };
     }
 
+    /// Checks the file at most every `watch_interval_ms`.
     fn changed(watch: *Watch, io: std.Io) bool {
         const now: std.Io.Timestamp = .now(io, .awake);
         if (watch.checked.durationTo(now).toMilliseconds() < watch_interval_ms) return false;
         watch.checked = now;
+        return watch.observe(stamp(io, watch.path) orelse return false);
+    }
 
-        const current = stamp(io, watch.path) orelse return false;
+    /// Whether to reload, given the file's state at this check.
+    fn observe(watch: *Watch, current: Stamp) bool {
         if (watch.loaded != null and std.meta.eql(current, watch.loaded.?)) {
             watch.pending = null;
             return false;
@@ -315,6 +319,22 @@ fn settle(app: *App, emulator: *Emulator) !void {
         if (!worked and !app.dirty) return;
     }
     return error.TestDidNotSettle;
+}
+
+test "a change reloads once it has held for a check, and only once" {
+    const a: Watch.Stamp = .{ .size = 1, .mtime = 1, .inode = 1 };
+    const b: Watch.Stamp = .{ .size = 2, .mtime = 2, .inode = 1 };
+    const c: Watch.Stamp = .{ .size = 3, .mtime = 3, .inode = 2 };
+    var watch: Watch = .{ .path = "", .loaded = a, .pending = null, .checked = undefined };
+    // Still being written: b, then c.
+    try std.testing.expect(!watch.observe(b));
+    try std.testing.expect(!watch.observe(c));
+    // c held for a whole interval.
+    try std.testing.expect(watch.observe(c));
+    try std.testing.expect(!watch.observe(c));
+    // Changing back to the loaded state cancels a pending reload.
+    try std.testing.expect(!watch.observe(a));
+    try std.testing.expect(!watch.observe(c));
 }
 
 test "shows the document, and keys move through it" {
