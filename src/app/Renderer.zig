@@ -328,6 +328,40 @@ test "a finished but uncollected tile is not queued again" {
     try std.testing.expect(!renderer.step());
 }
 
+test "on its thread, results wake the UI, and deinit stops it while busy" {
+    const gpa = std.testing.allocator;
+    var fds: [2]std.posix.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&fds));
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    var renderer: Renderer = undefined;
+    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, fds[1]);
+    defer renderer.deinit();
+    try renderer.start();
+
+    // The load's result arrives with a wake-up byte.
+    var poll_fds = [_]std.posix.pollfd{.{ .fd = fds[0], .events = std.posix.POLL.IN, .revents = 0 }};
+    try std.testing.expectEqual(1, try std.posix.poll(&poll_fds, 5000));
+    var results: std.ArrayList(Result) = .empty;
+    defer {
+        for (results.items) |result| result.deinit(gpa);
+        results.deinit(gpa);
+    }
+    // The byte is written after the result is added, so it is there.
+    renderer.collect(&results);
+    try std.testing.expectEqual(.opened, std.meta.activeTag(results.items[0]));
+
+    // Leave work queued for `deinit` to stop.
+    var tiles: [viewer.tiles_max]Tile = undefined;
+    for (&tiles, 0..) |*tile, row| {
+        tile.* = test_tile;
+        tile.page_height = 1024 * viewer.tiles_max;
+        tile.row = @intCast(row);
+    }
+    renderer.want(&tiles);
+}
+
 test "invert keeps alpha" {
     var pixels = [_]u8{ 255, 0, 10, 200 };
     invert(&pixels);
