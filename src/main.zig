@@ -39,22 +39,22 @@ pub fn main(init: std.process.Init) !void {
         error.NotATerminal => fail("output is not a terminal", .{}),
         else => fail("cannot determine the terminal size: {t}", .{err}),
     };
-    if (options.protocol == .auto) {
-        const supported = graphics.supported(&input.interface, stdout) catch |err| switch (err) {
-            error.NoReply => false,
-            else => fail("cannot query the terminal: {t}", .{err}),
-        };
-        if (!supported) fail(
-            "terminal does not support the kitty graphics protocol (use --protocol kitty to try anyway)",
-            .{},
-        );
-    }
+    // Forcing the protocol skips detection, so also the faster medium.
+    const detected = if (options.protocol == .auto) graphics.detect(&input.interface, stdout) catch |err| switch (err) {
+        error.NoReply => null,
+        else => fail("cannot query the terminal: {t}", .{err}),
+    } else .direct;
+    const medium = detected orelse fail(
+        "terminal does not support the kitty graphics protocol (use --protocol kitty to try anyway)",
+        .{},
+    );
 
     app.run(io, init.gpa, .{
         .path = options.file,
         .page = options.page,
         .dark = options.dark,
         .watch = options.watch,
+        .medium = medium,
     }, size, stdout) catch |err| switch (err) {
         error.FileNotFound => fail("cannot open '{s}': file not found", .{options.file}),
         error.AccessDenied => fail("cannot open '{s}': permission denied", .{options.file}),

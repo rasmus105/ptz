@@ -61,6 +61,7 @@ pub const Emulator = struct {
                 .rows = size.rows,
                 // The library default (10 MB) is smaller than one full-screen page.
                 .kitty_image_storage_limit = 1024 * 1024 * 1024,
+                .kitty_image_loading_limits = .{ .file = false, .temporary_file = .disabled, .shared_memory = true },
             }),
             .stream = undefined,
             .replies = .empty,

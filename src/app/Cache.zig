@@ -110,9 +110,8 @@ pub fn useStale(cache: *Cache, key: Tile.Key) ?*Entry {
 
 pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, entry: *Entry) std.Io.Writer.Error!void {
     const encoded = entry.encoded.?;
-    try graphics.transmit(writer, entry.id, encoded);
-    encoded.deinit(gpa);
     entry.encoded = null;
+    try graphics.transmit(gpa, writer, entry.id, encoded);
     cache.uploaded_bytes += entry.pixel_bytes;
 }
 

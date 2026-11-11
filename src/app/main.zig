@@ -43,6 +43,7 @@ pub const Options = struct {
     page: u32,
     dark: bool,
     watch: bool,
+    medium: graphics.Medium,
 };
 
 pub const App = struct {
@@ -81,7 +82,7 @@ pub const App = struct {
             .dirty = true,
             .open_error = null,
         };
-        app.renderer.init(io, gpa, options.path, wake_fd);
+        app.renderer.init(io, gpa, options.path, options.medium, wake_fd);
     }
 
     pub fn deinit(app: *App) void {
@@ -149,11 +150,11 @@ pub const App = struct {
                 continue;
             };
             const encoded = entry.encoded orelse continue;
-            if (encoded.base64.len > upload_budget and upload_budget < upload_bytes_per_frame) {
+            if (encoded.transmitLen() > upload_budget and upload_budget < upload_bytes_per_frame) {
                 app.dirty = true;
                 continue;
             }
-            upload_budget -|= encoded.base64.len;
+            upload_budget -|= encoded.transmitLen();
             try app.cache.upload(app.gpa, output, entry);
         }
         app.renderer.want(missing[0..missing_len]);
@@ -323,7 +324,13 @@ test "shows the document, and keys move through it" {
     defer emulator.destroy();
     const app = try gpa.create(App);
     defer gpa.destroy(app);
-    app.init(std.testing.io, gpa, .{ .path = "src/pdf/testdata/red-square.pdf", .page = 1, .dark = false, .watch = false }, size, null);
+    app.init(std.testing.io, gpa, .{
+        .path = "src/pdf/testdata/red-square.pdf",
+        .page = 1,
+        .dark = false,
+        .watch = false,
+        .medium = .shared_memory,
+    }, size, null);
     defer app.deinit();
     try settle(app, emulator);
 

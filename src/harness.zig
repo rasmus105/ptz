@@ -83,7 +83,13 @@ pub fn main(init: std.process.Init) !void {
     defer emulator.destroy();
     const viewer = try gpa.create(app.App);
     defer gpa.destroy(viewer);
-    viewer.init(io, gpa, .{ .path = options.file, .page = options.page, .dark = options.dark, .watch = false }, size, null);
+    viewer.init(io, gpa, .{
+        .path = options.file,
+        .page = options.page,
+        .dark = options.dark,
+        .watch = false,
+        .medium = .shared_memory,
+    }, size, null);
     defer viewer.deinit();
 
     try settle(viewer, emulator);

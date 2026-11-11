@@ -46,6 +46,7 @@ pub const Result = union(enum) {
 io: std.Io,
 gpa: std.mem.Allocator,
 path: []const u8,
+medium: graphics.Medium,
 wake_fd: ?std.posix.fd_t,
 thread: ?std.Thread,
 
@@ -71,11 +72,19 @@ scratch: []u8,
 // ====================================================================================================
 
 /// The first `step` loads the document.
-pub fn init(renderer: *Renderer, io: std.Io, gpa: std.mem.Allocator, path: []const u8, wake_fd: ?std.posix.fd_t) void {
+pub fn init(
+    renderer: *Renderer,
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    path: []const u8,
+    medium: graphics.Medium,
+    wake_fd: ?std.posix.fd_t,
+) void {
     renderer.* = .{
         .io = io,
         .gpa = gpa,
         .path = path,
+        .medium = medium,
         .wake_fd = wake_fd,
         .thread = null,
         .mutex = .init,
@@ -220,7 +229,7 @@ fn render(renderer: *Renderer, tile: Tile) ?Result {
         return .{ .render_failed = tile.key };
     if (tile.key.dark) invert(bitmap.pixels);
 
-    const encoded = graphics.Encoded.init(renderer.gpa, .{
+    const encoded = graphics.Encoded.init(renderer.gpa, renderer.medium, .{
         .width = bitmap.width,
         .height = bitmap.height,
         .pixels = bitmap.pixels,
@@ -243,7 +252,7 @@ fn invert(pixels: []u8) void {
 test "loads, then renders wanted tiles of the loaded version only" {
     const gpa = std.testing.allocator;
     var renderer: Renderer = undefined;
-    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", null);
+    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
     defer renderer.deinit();
 
     var results: std.ArrayList(Result) = .empty;
