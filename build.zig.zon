@@ -2,6 +2,20 @@
     .name = .ptz,
     .version = "0.0.1",
     .minimum_zig_version = "0.17.1",
+    .dependencies = .{
+        // Prebuilt PDFium shared libraries; only the one matching the target
+        // is fetched.
+        .pdfium_macos_aarch64 = .{
+            .url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8152/pdfium-mac-arm64.tgz",
+            .hash = "N-V-__8AAPNEfQB7caBMOE6EUUhVHLC3YVJsvs4nFx0eCd_p",
+            .lazy = true,
+        },
+        .pdfium_linux_x86_64 = .{
+            .url = "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium%2F8152/pdfium-linux-x64.tgz",
+            .hash = "N-V-__8AAB3ThwDEGkOIty8LmEC5tpGuKKWtCTAOX5CVpOeJ",
+            .lazy = true,
+        },
+    },
     .paths = .{""},
     .fingerprint = 0x50339592758f7757,
 }
