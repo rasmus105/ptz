@@ -109,7 +109,11 @@ pub const Document = struct {
             pdfium.FPDF_InitLibrary();
             engine_initialized = true;
         }
-        const handle = pdfium.FPDF_LoadMemDocument64(bytes.ptr, bytes.len, null) orelse return lastError();
+        // A newly created file can be opened before its producer writes a PDF.
+        const handle = (if (bytes.len == 0)
+            pdfium.FPDF_CreateNewDocument()
+        else
+            pdfium.FPDF_LoadMemDocument64(bytes.ptr, bytes.len, null)) orelse return lastError();
         return .{
             .io = io,
             .gpa = gpa,

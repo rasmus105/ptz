@@ -460,3 +460,43 @@ test "shows the document, and keys move through it" {
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, dark.pixel(300, 40));
     try std.testing.expect(app.input("q"));
 }
+
+test "an empty file stays open and reloads when PDF content arrives" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty.pdf", .data = "" });
+    const path = try tmp.dir.realPathFileAlloc(io, "empty.pdf", gpa);
+    defer gpa.free(path);
+
+    const size: terminal.Size = .{ .cols = 40, .rows = 11, .cell_width = 10, .cell_height = 20 };
+    const emulator: *Emulator = try .create(io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(io, gpa, .{
+        .path = path,
+        .page = 1,
+        .dark = false,
+        .watch = true,
+        .medium = .shared_memory,
+    }, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(null, app.open_error);
+    try std.testing.expectEqualStrings("no pages", app.frame.status().right);
+    try std.testing.expectEqual(0, app.frame.slices().len);
+    try std.testing.expect(!app.input("jG+-"));
+    try app.settle(&emulator.output);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty.pdf", .data = @embedFile("../pdf/testdata/red-square.pdf") });
+    // The file watcher requests this same reload once the write settles.
+    app.renderer.reload();
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(null, app.open_error);
+    try std.testing.expectEqual(1, app.page_sizes.len);
+    const screen = try emulator.screenshot(gpa);
+    defer gpa.free(screen.pixels);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, screen.pixel(80, 120));
+}
