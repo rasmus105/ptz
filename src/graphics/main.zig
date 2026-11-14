@@ -121,6 +121,22 @@ pub const Encoded = struct {
     }
 };
 
+/// Cleanup ownership for a shared-memory upload until the terminal unlinks it.
+/// A successful write or flush only queues bytes; the terminal may not have
+/// opened the object yet, so callers retain this across image eviction.
+pub const Transfer = struct {
+    name: shm.Name,
+    bytes: u64,
+
+    pub fn pending(transfer: Transfer) bool {
+        return transfer.name.exists();
+    }
+
+    pub fn deinit(transfer: Transfer) void {
+        transfer.name.unlink();
+    }
+};
+
 /// Pixel rectangle within an image.
 pub const Rect = struct {
     x: u32,
@@ -152,10 +168,16 @@ pub fn detect(input: *std.Io.Reader, output: *std.Io.Writer) terminal.Error!?Med
 }
 
 /// Uploads an image under `id`, replacing any image with that id. Consumes
-/// `encoded`, whose data now belongs to the terminal.
-pub fn transmit(gpa: std.mem.Allocator, writer: *std.Io.Writer, id: ImageId, encoded: Encoded) std.Io.Writer.Error!void {
+/// `encoded`, also on error. Retain the returned cleanup token until the
+/// terminal unlinks its object, or until output is abandoned.
+pub fn transmit(gpa: std.mem.Allocator, writer: *std.Io.Writer, id: ImageId, encoded: Encoded) std.Io.Writer.Error!?Transfer {
     defer if (encoded.data == .direct) gpa.free(encoded.data.direct);
+    errdefer if (encoded.data == .shared_memory) encoded.data.shared_memory.unlink();
     try kitty.transmit(writer, id, encoded);
+    return switch (encoded.data) {
+        .direct => null,
+        .shared_memory => |name| .{ .name = name, .bytes = @as(u64, encoded.width) * encoded.height * 4 },
+    };
 }
 
 /// Shows part of an uploaded image. The cursor ends up at the placement's

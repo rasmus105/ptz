@@ -56,6 +56,10 @@ const Entry = struct {
 // ====================================================================================================
 
 entries: std.AutoArrayHashMapUnmanaged(Tile, Entry),
+/// Names remain owned after eviction until the terminal consumes the upload.
+transfers: std.ArrayList(graphics.Transfer),
+transfer_bytes: u64,
+transfer_budget_bytes: u64,
 next_id: graphics.ImageId,
 /// Budgets; the constants above except in tests.
 uploaded_budget_bytes: u64,
@@ -72,6 +76,9 @@ clock: u64,
 pub fn init(uploaded_budget_bytes: u64, pending_budget_bytes: u64) Cache {
     return .{
         .entries = .empty,
+        .transfers = .empty,
+        .transfer_bytes = 0,
+        .transfer_budget_bytes = uploaded_bytes_max,
         .next_id = image_id_base,
         .uploaded_budget_bytes = uploaded_budget_bytes,
         .pending_budget_bytes = pending_budget_bytes,
@@ -84,6 +91,8 @@ pub fn init(uploaded_budget_bytes: u64, pending_budget_bytes: u64) Cache {
 pub fn deinit(cache: *Cache, gpa: std.mem.Allocator) void {
     for (cache.entries.values()) |entry| if (entry.state == .pending) entry.state.pending.deinit(gpa);
     cache.entries.deinit(gpa);
+    for (cache.transfers.items) |transfer| transfer.deinit();
+    cache.transfers.deinit(gpa);
     cache.* = undefined;
 }
 
@@ -122,7 +131,15 @@ pub fn findMissing(cache: *Cache, tiles: []const Tile, missing: []Tile) []Tile {
 
 /// Uploads the pending ones of `tiles`, in order, until about
 /// `budget_bytes` have been written. Returns whether any are left.
-pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, tiles: []const Tile, budget_bytes: usize) std.Io.Writer.Error!bool {
+pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, tiles: []const Tile, budget_bytes: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!bool {
+    var index: usize = 0;
+    while (index < cache.transfers.items.len) {
+        if (cache.transfers.items[index].pending()) {
+            index += 1;
+        } else {
+            cache.transfer_bytes -= cache.transfers.swapRemove(index).bytes;
+        }
+    }
     var written: usize = 0;
     for (tiles) |tile| {
         const entry = cache.entries.getPtr(tile) orelse continue;
@@ -131,10 +148,20 @@ pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, til
         // The first upload always goes, so a huge tile can't stall forever.
         if (written > 0 and written + encoded.transmitLen() > budget_bytes) return true;
         written += encoded.transmitLen();
-        entry.state = .uploaded;
+        if (encoded.data == .shared_memory) {
+            // A non-consuming terminal must not leave unlimited kernel memory
+            // linked outside the cache's image budgets.
+            if (bytes(tile) > cache.transfer_budget_bytes -| cache.transfer_bytes) return error.OutOfMemory;
+            try cache.transfers.ensureUnusedCapacity(gpa, 1);
+        }
+        entry.state = .failed;
         cache.pending_bytes -= bytes(tile);
+        if (try graphics.transmit(gpa, writer, entry.id, encoded)) |transfer| {
+            cache.transfers.appendAssumeCapacity(transfer);
+            cache.transfer_bytes += transfer.bytes;
+        }
+        entry.state = .uploaded;
         cache.uploaded_bytes += bytes(tile);
-        try graphics.transmit(gpa, writer, entry.id, encoded);
     }
     return false;
 }
@@ -197,6 +224,9 @@ pub fn clear(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer) void
         .failed => {},
     };
     cache.entries.clearRetainingCapacity();
+    for (cache.transfers.items) |transfer| transfer.deinit();
+    cache.transfers.clearRetainingCapacity();
+    cache.transfer_bytes = 0;
     cache.uploaded_bytes = 0;
     cache.pending_bytes = 0;
 }
@@ -310,4 +340,102 @@ test "clear forgets everything even when the terminal is gone" {
     var failing: std.Io.Writer = .failing;
     cache.clear(gpa, &failing);
     try std.testing.expectEqual(0, cache.entries.count());
+}
+
+test "failed shared-memory output releases objects even after buffering" {
+    const gpa = std.testing.allocator;
+    for ([_]bool{ false, true }) |buffered| {
+        var cache: Cache = .init(1024, 1024);
+        defer cache.deinit(gpa);
+        const canvas = try graphics.Canvas.init(gpa, .shared_memory, 16, 16);
+        @memset(canvas.pixels, 255);
+        const encoded = try canvas.finish(gpa);
+        const name = encoded.data.shared_memory;
+        defer name.unlink();
+        try cache.put(gpa, testTile(0, 1), encoded);
+
+        var buffer: [1024]u8 = undefined;
+        var output: std.Io.Writer = .failing;
+        if (buffered) output.buffer = &buffer;
+        if (buffered) {
+            try std.testing.expect(!try cache.upload(gpa, &output, &.{testTile(0, 1)}, 1024));
+            try std.testing.expect(name.exists());
+            try std.testing.expectError(error.WriteFailed, output.flush());
+        } else {
+            try std.testing.expectError(error.WriteFailed, cache.upload(gpa, &output, &.{testTile(0, 1)}, 1024));
+        }
+        cache.clear(gpa, &output);
+        try std.testing.expect(!name.exists());
+    }
+}
+
+test "eviction preserves a shared-memory upload until the terminal reads it" {
+    const gpa = std.testing.allocator;
+    var cache: Cache = .init(0, 0);
+    defer cache.deinit(gpa);
+    const canvas = try graphics.Canvas.init(gpa, .shared_memory, 16, 16);
+    @memset(canvas.pixels, 255);
+    const encoded = try canvas.finish(gpa);
+    const name = encoded.data.shared_memory;
+    defer name.unlink();
+    const tile = testTile(0, 1);
+    try cache.put(gpa, tile, encoded);
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    try std.testing.expect(!try cache.upload(gpa, &output.writer, &.{tile}, 1024));
+    const transmitted_len = output.written().len;
+    const id = cache.shown(tile).?;
+    try cache.evict(gpa, &output.writer);
+    try cache.evict(gpa, &output.writer);
+    try std.testing.expectEqual(null, cache.shown(tile));
+    try std.testing.expect(name.exists());
+
+    const Emulator = @import("../emulator/main.zig").Emulator;
+    const emulator: *Emulator = try .create(std.testing.io, gpa, .{ .cols = 2, .rows = 2, .cell_width = 16, .cell_height = 16 });
+    defer emulator.destroy();
+    try emulator.output.writeAll(output.written()[0..transmitted_len]);
+    try graphics.place(&emulator.output, .{
+        .image = id,
+        .source = .{ .x = 0, .y = 0, .width = 16, .height = 16 },
+        .col = 0,
+        .row = 0,
+        .x_offset = 0,
+        .y_offset = 0,
+    });
+    try emulator.output.flush();
+    const screen = try emulator.screenshot(gpa);
+    defer gpa.free(screen.pixels);
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, screen.pixel(8, 8));
+    try std.testing.expect(!name.exists());
+    try std.testing.expect(!try cache.upload(gpa, &output.writer, &.{}, 1024));
+}
+
+test "a non-consuming terminal cannot retain unbounded shared memory" {
+    const gpa = std.testing.allocator;
+    var cache: Cache = .init(1024, 2048);
+    defer cache.deinit(gpa);
+    cache.transfer_budget_bytes = 1024;
+    const first = try graphics.Canvas.init(gpa, .shared_memory, 16, 16);
+    const first_encoded = try first.finish(gpa);
+    defer first_encoded.data.shared_memory.unlink();
+    const second = try graphics.Canvas.init(gpa, .shared_memory, 16, 16);
+    const second_encoded = try second.finish(gpa);
+    defer second_encoded.data.shared_memory.unlink();
+    try cache.put(gpa, testTile(0, 1), first_encoded);
+    try cache.put(gpa, testTile(1, 1), second_encoded);
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    try std.testing.expect(!try cache.upload(gpa, &output.writer, &.{testTile(0, 1)}, 1024));
+    const transmitted_len = output.written().len;
+    try std.testing.expectError(error.OutOfMemory, cache.upload(gpa, &output.writer, &.{testTile(1, 1)}, 1024));
+    try std.testing.expectEqual(transmitted_len, output.written().len);
+    try std.testing.expect(first_encoded.data.shared_memory.exists());
+    try std.testing.expect(second_encoded.data.shared_memory.exists());
+    // The terminal releases this name after consuming its pixels.
+    first_encoded.data.shared_memory.unlink();
+    try std.testing.expect(!try cache.upload(gpa, &output.writer, &.{testTile(1, 1)}, 1024));
+    try std.testing.expect(output.written().len > transmitted_len);
+    cache.clear(gpa, &output.writer);
+    try std.testing.expect(!first_encoded.data.shared_memory.exists());
+    try std.testing.expect(!second_encoded.data.shared_memory.exists());
 }

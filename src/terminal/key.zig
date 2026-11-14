@@ -35,8 +35,8 @@ pub const Key = union(enum) {
 
     /// Decodes the first key in `bytes`, which must not be empty, or returns
     /// null if `bytes` ends inside a sequence; decode again once more bytes
-    /// have arrived. Terminals write a key's whole sequence at once, so a
-    /// lone ESC is the Escape key rather than the start of a sequence.
+    /// have arrived. A lone ESC is ambiguous; the caller resolves it as
+    /// Escape only after an input timeout.
     pub fn decode(bytes: []const u8) ?Decoded {
         std.debug.assert(bytes.len > 0);
         const byte = bytes[0];
@@ -57,7 +57,7 @@ pub const Key = union(enum) {
 
     fn decodeEscape(bytes: []const u8) ?Decoded {
         std.debug.assert(bytes[0] == 0x1b);
-        if (bytes.len == 1) return .{ .key = .escape, .len = 1 };
+        if (bytes.len == 1) return null;
         // SS3 sequences (`ESC O A`) are what arrow keys send in application mode.
         if (bytes[1] == 'O') {
             if (bytes.len < 3) return null;
@@ -135,7 +135,7 @@ test "escape sequences for navigation keys" {
 }
 
 test "lone escape and unrecognized sequences" {
-    try expectKeys("\x1b", &.{.escape});
+    try std.testing.expectEqual(null, Key.decode("\x1b"));
     try expectKeys("\x1bx", &.{ .escape, .{ .char = 'x' } });
     // A query reply and an F-key are skipped as single units.
     try expectKeys("\x1b[?62;22c\x1b[15~q", &.{ .unknown, .unknown, .{ .char = 'q' } });

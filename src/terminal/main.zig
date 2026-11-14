@@ -119,13 +119,15 @@ pub const Input = struct {
 
 /// Signal handling for `notifySignals`.
 const Signals = struct {
-    var fd: posix.fd_t = -1;
+    var fd: std.atomic.Value(posix.fd_t) = .init(-1);
+    var pending: std.atomic.Value(u8) = .init(0);
 
     fn handle(signal: posix.SIG) callconv(.c) void {
         // The interrupted code may be about to read errno.
         const saved = std.c._errno().*;
         defer std.c._errno().* = saved;
-        _ = std.c.write(fd, if (signal == .WINCH) "r" else "q", 1);
+        _ = pending.fetchOr(if (signal == .WINCH) 1 else 2, .monotonic);
+        _ = std.c.write(fd.load(.monotonic), "s", 1);
     }
 };
 
@@ -143,18 +145,24 @@ pub fn restoreAfterCrash() void {
     RawMode.crash_restore = null;
 }
 
-/// Turns signals into bytes written to `fd`, so an event loop polling `fd`
-/// wakes up: `r` when the window is resized, and `q` when asked to stop
-/// (SIGTERM, SIGHUP, SIGINT), which then quits through normal cleanup.
-/// Null restores the default handling.
+/// Wakes an event loop on resize or termination (SIGTERM, SIGHUP, SIGINT).
+/// The write end must be nonblocking; `takeSignals` preserves events even
+/// when a full pipe coalesces notifications. Null restores default handling.
 pub fn notifySignals(fd: ?posix.fd_t) void {
-    Signals.fd = fd orelse -1;
+    Signals.pending.store(0, .monotonic);
+    Signals.fd.store(fd orelse -1, .monotonic);
     const action: posix.Sigaction = .{
         .handler = .{ .handler = if (fd == null) posix.SIG.DFL else Signals.handle },
         .mask = posix.sigemptyset(),
         .flags = posix.SA.RESTART,
     };
     for ([_]posix.SIG{ .WINCH, .TERM, .HUP, .INT }) |signal| posix.sigaction(signal, &action, null);
+}
+
+/// Takes signal events independently of the wake bytes, which may coalesce.
+pub fn takeSignals() struct { resized: bool, quit: bool } {
+    const pending = Signals.pending.swap(0, .monotonic);
+    return .{ .resized = pending & 1 != 0, .quit = pending & 2 != 0 };
 }
 
 /// Cells `text` takes on screen: two for East Asian wide characters and
@@ -174,6 +182,22 @@ pub fn textWidth(text: []const u8) usize {
         rest = rest[len..];
     }
     return width;
+}
+
+/// Writes display text without interpreting filename or input bytes as
+/// terminal commands. Invalid UTF-8 and control characters occupy one cell.
+pub fn writeText(writer: *std.Io.Writer, text: []const u8) std.Io.Writer.Error!void {
+    var rest = text;
+    while (rest.len > 0) {
+        const len = charLen(rest);
+        const char = std.unicode.utf8Decode(rest[0..len]) catch 0;
+        if ((len == 1 and rest[0] >= 0x80) or char < 0x20 or (char >= 0x7f and char <= 0x9f)) {
+            try writer.writeByte('?');
+        } else {
+            try writer.writeAll(rest[0..len]);
+        }
+        rest = rest[len..];
+    }
 }
 
 /// Bytes of the first character in `text`: its UTF-8 sequence, or one for
@@ -250,4 +274,29 @@ pub fn query(input: *std.Io.Reader, output: *std.Io.Writer, comptime request: []
 
 test {
     _ = Key;
+}
+
+test "a full wake pipe preserves signals without blocking or changing errno" {
+    var fds: [2]posix.fd_t = undefined;
+    try std.testing.expectEqual(0, std.c.pipe(&fds));
+    defer for (fds) |fd| {
+        _ = std.c.close(fd);
+    };
+    const flags: c_int = @bitCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    try std.testing.expectEqual(0, std.c.fcntl(fds[1], posix.F.SETFL, flags));
+    notifySignals(fds[1]);
+    defer notifySignals(null);
+    var bytes: [4096]u8 = undefined;
+    @memset(&bytes, 't');
+    while (std.c.write(fds[1], &bytes, bytes.len) > 0) {}
+    while (std.c.write(fds[1], &bytes, 1) > 0) {}
+    const saved = std.c._errno().*;
+    Signals.handle(.WINCH);
+    Signals.handle(.TERM);
+    try std.testing.expectEqual(saved, std.c._errno().*);
+    const events = takeSignals();
+    try std.testing.expect(events.resized);
+    try std.testing.expect(events.quit);
+    const cleared = takeSignals();
+    try std.testing.expect(!cleared.resized and !cleared.quit);
 }

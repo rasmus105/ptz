@@ -232,12 +232,13 @@ pub const State = struct {
     }
 
     fn setZoom(state: *State, zoom: f32) void {
+        const half_width = @as(f32, @floatFromInt(state.geometry.view_width)) / 2;
+        // Relayout clamps pan to the new bounds, so save the old centre first.
+        const old_centre = @as(f32, @floatFromInt(state.pan_x)) + half_width;
         const old_scale = state.geometry.scale;
         state.zoom = std.math.clamp(zoom, zoom_min, zoom_max);
         state.relayout();
-        // Keep the horizontal centre of the view where it was.
-        const half_width = @as(f32, @floatFromInt(state.geometry.view_width)) / 2;
-        const centre = (@as(f32, @floatFromInt(state.pan_x)) + half_width) * state.geometry.scale / old_scale;
+        const centre = old_centre * (state.geometry.scale / old_scale);
         const pan_max: f32 = @floatFromInt(state.geometry.panMax());
         state.pan_x = @intFromFloat(std.math.clamp(centre - half_width, 0, pan_max));
     }
@@ -414,6 +415,35 @@ test "zooming keeps the position in the page and the centre of the view" {
     try std.testing.expectEqual(0, viewer.state.pan_x);
 }
 
+test "zooming out preserves the horizontal centre until it reaches a boundary" {
+    for ([_]struct { pan: u32, expected: u32 }{
+        .{ .pan = 0, .expected = 0 },
+        .{ .pan = 400, .expected = 240 },
+        .{ .pan = 800, .expected = 480 },
+    }) |case| {
+        var viewer: TestViewer = undefined;
+        viewer.init();
+        _ = viewer.feed(":zoom 200\r");
+        viewer.state.pan_x = case.pan;
+        _ = viewer.feed("-");
+        try std.testing.expectEqual(case.expected, viewer.state.pan_x);
+    }
+}
+
+test "page navigation at minimum zoom fits a one-pixel-wide view" {
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.state.update(.{ .resize = .{ .cols = 1, .rows = 2, .cell_width = 1, .cell_height = 1 } });
+    _ = viewer.feed(":zoom 25\rG");
+    var frame: Frame = undefined;
+    viewer.state.layout(&frame);
+    try std.testing.expectEqual(2, viewer.state.anchor.page);
+    try std.testing.expectEqual(0, viewer.state.pan_x);
+    try std.testing.expectEqual(1, frame.slices().len);
+    try std.testing.expectEqual(1, frame.slices()[0].width);
+    try std.testing.expectEqual(0, frame.slices()[0].x);
+}
+
 test "command line" {
     var viewer: TestViewer = undefined;
     viewer.init();
@@ -497,4 +527,14 @@ test "the first page applies once the document arrives" {
     var state: State = .init("doc.pdf", test_size, false, 3);
     _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &test_pages, .page_offsets = &test_offsets } });
     try std.testing.expectEqual(2, state.anchor.page);
+}
+
+test "zooming beyond the maximum keeps the horizontal position" {
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.state.update(.{ .resize = .{ .cols = 40, .rows = 25, .cell_width = 10, .cell_height = 20 } });
+    _ = viewer.feed(":zoom 800\r");
+    viewer.state.pan_x = 12;
+    _ = viewer.feed("+");
+    try std.testing.expectEqual(12, viewer.state.pan_x);
 }

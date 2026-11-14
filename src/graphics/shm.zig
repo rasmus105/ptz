@@ -31,6 +31,14 @@ pub const Name = struct {
         return name.buffer[0..name.len :0];
     }
 
+    pub fn exists(name: *const Name) bool {
+        const flags: std.c.O = .{ .ACCMODE = .RDONLY };
+        const fd = std.c.shm_open(name.slice(), @bitCast(@as(u32, @bitCast(flags))), @as(c_uint, 0));
+        if (fd < 0) return std.c._errno().* != @backingInt(posix.E.NOENT);
+        _ = std.c.close(fd);
+        return true;
+    }
+
     pub fn unlink(name: *const Name) void {
         _ = std.c.shm_unlink(name.slice());
     }

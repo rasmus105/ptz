@@ -100,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
             std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
         keys = keys[len..];
         if (viewer.input(bytes)) break;
+        // Each harness key is complete, including a standalone Escape.
+        if (viewer.escape_started) |started| viewer.expireInput(started.addDuration(.fromSeconds(1)));
         try viewer.settle(&emulator.output);
     }
     if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });

@@ -32,6 +32,8 @@ const posix = std.posix;
 const upload_bytes_per_frame = 8 * 1024 * 1024;
 /// How often to check the file for changes when watching.
 const watch_interval_ms = 250;
+/// Distinguishes Escape from an escape sequence split across reads.
+const escape_timeout_ms = 50;
 /// The longest key sequence kept while waiting for the rest of it.
 const pending_input_max = 32;
 /// The most bytes `App.input` takes at once.
@@ -63,6 +65,7 @@ pub const App = struct {
     /// The start of a key sequence cut off at the end of the last input.
     pending_input: [pending_input_max]u8,
     pending_input_len: u32,
+    escape_started: ?std.Io.Timestamp,
     /// Whether the screen is out of date.
     dirty: bool,
     /// Set when the document can't be loaded and there is nothing to show.
@@ -88,6 +91,7 @@ pub const App = struct {
             .results = .empty,
             .pending_input = undefined,
             .pending_input_len = 0,
+            .escape_started = null,
             .dirty = true,
             .open_error = null,
         };
@@ -109,11 +113,13 @@ pub const App = struct {
     /// is kept until the rest arrives.
     pub fn input(app: *App, bytes: []const u8) bool {
         std.debug.assert(bytes.len <= input_len_max);
+        if (bytes.len == 0) return false;
         var buffer: [pending_input_max + input_len_max]u8 = undefined;
         @memcpy(buffer[0..app.pending_input_len], app.pending_input[0..app.pending_input_len]);
         @memcpy(buffer[app.pending_input_len..][0..bytes.len], bytes);
         var unread = buffer[0 .. app.pending_input_len + bytes.len];
         app.pending_input_len = 0;
+        app.escape_started = null;
 
         while (unread.len > 0) {
             const decoded = terminal.Key.decode(unread) orelse {
@@ -121,6 +127,7 @@ pub const App = struct {
                 if (unread.len <= pending_input_max) {
                     @memcpy(app.pending_input[0..unread.len], unread);
                     app.pending_input_len = @intCast(unread.len);
+                    if (std.mem.eql(u8, unread, "\x1b")) app.escape_started = .now(app.renderer.io, .awake);
                 }
                 return false;
             };
@@ -135,14 +142,24 @@ pub const App = struct {
         return false;
     }
 
+    /// Resolves a standalone Escape once its continuation deadline passes.
+    pub fn expireInput(app: *App, now: std.Io.Timestamp) void {
+        const started = app.escape_started orelse return;
+        if (started.durationTo(now).toMilliseconds() < escape_timeout_ms) return;
+        app.escape_started = null;
+        app.pending_input_len = 0;
+        app.dirty = true;
+        _ = app.state.update(.{ .key = .escape });
+    }
+
     pub fn resize(app: *App, size: terminal.Size) void {
         app.dirty = true;
         _ = app.state.update(.{ .resize = size });
     }
 
     /// Takes in what the renderer finished since the last call.
-    pub fn collect(app: *App) void {
-        app.renderer.collect(&app.results);
+    pub fn collect(app: *App) std.mem.Allocator.Error!void {
+        try app.renderer.collect(&app.results);
         defer app.results.clearRetainingCapacity();
         for (app.results.items, 0..) |result, index| {
             app.dirty = true;
@@ -158,7 +175,7 @@ pub const App = struct {
 
     /// Draws the current frame, asking the renderer for missing tiles and
     /// uploading finished ones. Stays dirty while uploads are pending.
-    pub fn draw(app: *App, output: *std.Io.Writer) std.Io.Writer.Error!void {
+    pub fn draw(app: *App, output: *std.Io.Writer) (std.mem.Allocator.Error || std.Io.Writer.Error)!void {
         const frame = &app.frame;
         app.state.layout(frame);
 
@@ -192,7 +209,7 @@ pub const App = struct {
     pub fn settle(app: *App, output: *std.Io.Writer) !void {
         std.debug.assert(app.renderer.thread == null);
         while (true) {
-            app.collect();
+            try app.collect();
             if (app.open_error != null) return;
             try app.draw(output);
             if (!app.renderer.step() and !app.dirty) return;
@@ -284,6 +301,9 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
     defer for (wake_fds) |fd| {
         _ = std.c.close(fd);
     };
+    // Wake bytes may coalesce; neither the worker nor a signal may block here.
+    const flags: c_int = @bitCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+    if (std.c.fcntl(wake_fds[1], posix.F.SETFL, flags) != 0) return error.Unexpected;
     terminal.notifySignals(wake_fds[1]);
     defer terminal.notifySignals(null);
 
@@ -291,6 +311,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
     defer gpa.destroy(app);
     app.init(io, gpa, options, size, wake_fds[1]);
     defer app.deinit();
+    var watch: Watch = .init(io, options.path);
     try app.renderer.start();
 
     try output.writeAll(terminal.fullscreen_enter);
@@ -300,7 +321,6 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
         output.flush() catch {};
     }
 
-    var watch: Watch = .init(io, options.path);
     var read_buffer: [input_len_max]u8 = undefined;
     while (true) {
         if (app.dirty) try app.draw(output);
@@ -310,7 +330,12 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
             .{ .fd = posix.STDIN_FILENO, .events = posix.POLL.IN, .revents = 0 },
             .{ .fd = wake_fds[0], .events = posix.POLL.IN, .revents = 0 },
         };
-        const timeout_ms: i32 = if (app.dirty) 0 else if (options.watch) watch_interval_ms else -1;
+        var timeout_ms: i32 = if (app.dirty) 0 else if (options.watch) watch_interval_ms else -1;
+        if (app.escape_started) |started| {
+            const elapsed = started.durationTo(.now(io, .awake)).toMilliseconds();
+            const remaining: i32 = @intCast(@max(0, escape_timeout_ms - elapsed));
+            timeout_ms = if (timeout_ms < 0) remaining else @min(timeout_ms, remaining);
+        }
         _ = try posix.poll(&fds, timeout_ms);
 
         if (fds[0].revents != 0) {
@@ -320,16 +345,18 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
             if (app.input(read_buffer[0..len])) return;
         }
         if (fds[1].revents != 0) {
-            const len = try posix.read(wake_fds[0], &read_buffer);
-            if (std.mem.indexOfScalar(u8, read_buffer[0..len], 'q') != null) return;
-            if (std.mem.indexOfScalar(u8, read_buffer[0..len], 'r') != null) {
-                var stdin: terminal.Input = .init(&read_buffer, 100);
-                const resized = terminal.size(&stdin.interface, output) catch app.state.size;
-                try output.writeAll(terminal.clear_screen);
-                app.resize(resized);
-            }
+            _ = try posix.read(wake_fds[0], &read_buffer);
         }
-        app.collect();
+        const signals = terminal.takeSignals();
+        if (signals.quit) return;
+        if (signals.resized) {
+            var stdin: terminal.Input = .init(&read_buffer, 100);
+            const resized = terminal.size(&stdin.interface, output) catch app.state.size;
+            try output.writeAll(terminal.clear_screen);
+            app.resize(resized);
+        }
+        app.expireInput(.now(io, .awake));
+        try app.collect();
         if (options.watch and watch.changed(io)) app.renderer.reload();
     }
 }
@@ -349,9 +376,9 @@ fn drawStatus(output: *std.Io.Writer, status: viewer.Status, size: terminal.Size
 
     try terminal.moveCursor(output, size.rows - 1, 0);
     try output.writeAll(terminal.style_reverse);
-    try output.writeAll(left);
+    try terminal.writeText(output, left);
     try output.splatByteAll(' ', padding);
-    try output.writeAll(right);
+    try terminal.writeText(output, right);
     try output.writeAll(terminal.style_reset);
 }
 
@@ -483,6 +510,7 @@ test "an empty file stays open and reloads when PDF content arrives" {
         .medium = .shared_memory,
     }, size, null);
     defer app.deinit();
+    var watch: Watch = .init(io, path);
     try app.settle(&emulator.output);
     try std.testing.expectEqual(null, app.open_error);
     try std.testing.expectEqualStrings("no pages", app.frame.status().right);
@@ -491,7 +519,9 @@ test "an empty file stays open and reloads when PDF content arrives" {
     try app.settle(&emulator.output);
 
     try tmp.dir.writeFile(io, .{ .sub_path = "empty.pdf", .data = @embedFile("../pdf/testdata/red-square.pdf") });
-    // The file watcher requests this same reload once the write settles.
+    const current = Watch.stamp(io, path).?;
+    try std.testing.expect(!watch.observe(current));
+    try std.testing.expect(watch.observe(current));
     app.renderer.reload();
     try app.settle(&emulator.output);
     try std.testing.expectEqual(null, app.open_error);
@@ -499,4 +529,74 @@ test "an empty file stays open and reloads when PDF content arrives" {
     const screen = try emulator.screenshot(gpa);
     defer gpa.free(screen.pixels);
     try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, screen.pixel(80, 120));
+}
+
+test "navigation sequences survive every input split without closing commands" {
+    const gpa = std.testing.allocator;
+    const size: terminal.Size = .{ .cols = 40, .rows = 3, .cell_width = 10, .cell_height = 20 };
+    const reference = try gpa.create(App);
+    defer gpa.destroy(reference);
+    const fragmented = try gpa.create(App);
+    defer gpa.destroy(fragmented);
+    const pages = [_]pdf.Size{.{ .width = 200, .height = 1000 }};
+    const offsets = [_]f64{0};
+    for ([_][]const u8{ "\x1b[A", "\x1b[B", "\x1bOC", "\x1b[1;5D", "\x1b[5~", "\x1b[6~", "\x1b[H", "\x1b[F" }) |sequence| {
+        for ([_]bool{ false, true }) |command| {
+            for (1..sequence.len) |split| {
+                for ([_]*App{ reference, fragmented }) |app| {
+                    app.init(std.testing.io, gpa, .{ .path = "unused.pdf", .page = 1, .dark = false, .watch = false, .medium = .direct }, size, null);
+                    _ = app.state.update(.{ .document = .{ .generation = 1, .page_sizes = &pages, .page_offsets = &offsets } });
+                    try std.testing.expect(!app.input("j"));
+                    if (command) try std.testing.expect(!app.input(":zoom 200"));
+                }
+                defer reference.deinit();
+                defer fragmented.deinit();
+                try std.testing.expect(!reference.input(sequence));
+                try std.testing.expect(!fragmented.input(sequence[0..split]));
+                try std.testing.expect(!fragmented.input(sequence[split..]));
+                try std.testing.expectEqual(reference.state.anchor, fragmented.state.anchor);
+                try std.testing.expectEqual(reference.state.pan_x, fragmented.state.pan_x);
+                try std.testing.expectEqual(reference.state.command_open, fragmented.state.command_open);
+                try std.testing.expectEqual(0, fragmented.pending_input_len);
+                if (command) {
+                    try std.testing.expect(!fragmented.input("\r"));
+                    try std.testing.expectEqual(2, fragmented.state.zoom);
+                }
+            }
+        }
+    }
+}
+
+test "standalone Escape closes the command only after its deadline" {
+    const gpa = std.testing.allocator;
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(std.testing.io, gpa, .{ .path = "unused.pdf", .page = 1, .dark = false, .watch = false, .medium = .direct }, .{ .cols = 40, .rows = 3, .cell_width = 10, .cell_height = 20 }, null);
+    defer app.deinit();
+    try std.testing.expect(!app.input(":zoom 200\x1b"));
+    const started = app.escape_started.?;
+    app.expireInput(started.addDuration(.fromMilliseconds(escape_timeout_ms - 1)));
+    try std.testing.expect(app.state.command_open);
+    app.expireInput(started.addDuration(.fromMilliseconds(escape_timeout_ms)));
+    try std.testing.expect(!app.state.command_open);
+    try std.testing.expectEqual(0, app.pending_input_len);
+    try std.testing.expect(app.input("q"));
+}
+
+test "control-bearing filenames cannot change the terminal through the status line" {
+    const gpa = std.testing.allocator;
+    const size: terminal.Size = .{ .cols = 80, .rows = 3, .cell_width = 1, .cell_height = 1 };
+    const emulator: *Emulator = try .create(std.testing.io, gpa, size);
+    defer emulator.destroy();
+    try emulator.output.writeAll("sentinel");
+    var state: viewer.State = .init("report\x1b[2J\r\n\x07\x7f\xc2\x9b\xff.pdf", size, false, 1);
+    var frame: viewer.Frame = undefined;
+    state.layout(&frame);
+    try drawStatus(&emulator.output, frame.status(), size);
+    try emulator.output.flush();
+    const text = try emulator.text(gpa);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "sentinel"));
+    try std.testing.expect(std.mem.indexOf(u8, text, "report?[2J??????.pdf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "loading...") != null);
 }

@@ -150,13 +150,16 @@ pub fn want(renderer: *Renderer, tiles: []const Tile) void {
     renderer.condition.signal(renderer.io);
 }
 
-/// Swaps finished results into `results`, which must be empty and use the
-/// renderer's allocator. The caller frees them.
-pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) void {
+/// Moves finished results into `results`, which must be empty and use the
+/// renderer's allocator. The caller frees them. On allocation failure, leaves
+/// them queued so the caller can retry or shut down.
+pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) std.mem.Allocator.Error!void {
     std.debug.assert(results.items.len == 0);
     renderer.mutex.lockUncancelable(renderer.io);
     defer renderer.mutex.unlock(renderer.io);
-    std.mem.swap(std.ArrayList(Result), results, &renderer.results);
+    // Keep the worker's reserved slot even if collection happens during a load.
+    try results.appendSlice(renderer.gpa, renderer.results.items);
+    renderer.results.clearRetainingCapacity();
 }
 
 /// Does one unit of work: a pending reload, else the most urgent tile.
@@ -286,7 +289,7 @@ const test_tile: Tile = .{
 fn expectCollected(renderer: *Renderer, results: *std.ArrayList(Result)) !void {
     for (results.items) |result| result.deinit(renderer.gpa);
     results.clearRetainingCapacity();
-    renderer.collect(results);
+    try renderer.collect(results);
 }
 
 test "loads, then renders wanted tiles of the loaded version only" {
@@ -349,7 +352,7 @@ test "on its thread, results wake the UI, and deinit stops it while busy" {
         results.deinit(gpa);
     }
     // The byte is written after the result is added, so it is there.
-    renderer.collect(&results);
+    try renderer.collect(&results);
     try std.testing.expectEqual(.opened, std.meta.activeTag(results.items[0]));
 
     // Leave work queued for `deinit` to stop.
@@ -366,4 +369,74 @@ test "invert keeps alpha" {
     var pixels = [_]u8{ 255, 0, 10, 200 };
     invert(&pixels);
     try std.testing.expectEqualSlices(u8, &.{ 0, 255, 245, 200 }, &pixels);
+}
+
+test "collection during a load does not lose its result" {
+    const DuringLoad = struct {
+        renderer: *Renderer,
+        collected: bool = false,
+        results: std.ArrayList(Result) = .empty,
+
+        fn alloc(context: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            // The first allocation reserves publication space; the next one
+            // reads the PDF with the renderer mutex released.
+            if (!self.collected and self.renderer.results.capacity > 0) {
+                self.collected = true;
+                self.renderer.collect(&self.results) catch unreachable;
+            }
+            return std.testing.allocator.rawAlloc(len, alignment, ra);
+        }
+
+        fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            std.testing.allocator.rawFree(memory, alignment, ra);
+        }
+    };
+    var renderer: Renderer = undefined;
+    var context: DuringLoad = .{ .renderer = &renderer };
+    const gpa: std.mem.Allocator = .{
+        .ptr = &context,
+        .vtable = &.{
+            .alloc = DuringLoad.alloc,
+            .resize = std.mem.Allocator.noResize,
+            .remap = std.mem.Allocator.noRemap,
+            .free = DuringLoad.free,
+        },
+    };
+    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    defer renderer.deinit();
+    defer {
+        for (context.results.items) |result| result.deinit(gpa);
+        context.results.deinit(gpa);
+    }
+    try std.testing.expect(renderer.step());
+    try std.testing.expect(context.collected);
+    try std.testing.expectEqual(0, context.results.items.len);
+    try renderer.collect(&context.results);
+    try std.testing.expectEqual(1, context.results.items.len);
+    try std.testing.expectEqual(1, context.results.items[0].opened.generation);
+    try std.testing.expectEqual(1, context.results.items[0].opened.page_sizes.len);
+    try std.testing.expect(!renderer.step());
+}
+
+test "collection failure preserves the loaded generation for retry" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    var renderer: Renderer = undefined;
+    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    defer renderer.deinit();
+    var results: std.ArrayList(Result) = .empty;
+    defer {
+        for (results.items) |result| result.deinit(gpa);
+        results.deinit(gpa);
+    }
+    try std.testing.expect(renderer.step());
+    failing.fail_index = failing.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, renderer.collect(&results));
+    try std.testing.expectEqual(0, results.items.len);
+    failing.fail_index = std.math.maxInt(usize);
+    try renderer.collect(&results);
+    try std.testing.expectEqual(1, results.items.len);
+    try std.testing.expectEqual(1, results.items[0].opened.generation);
+    try std.testing.expectEqual(1, results.items[0].opened.page_sizes.len);
 }

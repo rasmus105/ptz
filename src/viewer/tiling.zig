@@ -152,8 +152,8 @@ pub const Geometry = struct {
             .content_width = 0,
             .content_height = 0,
         };
-        geometry.content_width = @intFromFloat(@round(widest * geometry.scale));
         if (page_sizes.len > 0) {
+            geometry.content_width = @max(1, @as(u32, @intFromFloat(@round(widest * geometry.scale))));
             const last: u32 = @intCast(page_sizes.len - 1);
             geometry.content_height = geometry.pageTop(last) + geometry.pageHeight(last);
         }
