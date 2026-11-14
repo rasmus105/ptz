@@ -34,7 +34,8 @@ pub const Emulator = struct {
     output_buffer: [4096]u8,
     input_buffer: [1024]u8,
 
-    /// The screen's pixels: placed images over a dark background. Text is
+    /// The screen's pixels: placed images over a transparent background, so
+    /// uncovered pixels (alpha 0) can't be mistaken for an image's. Text is
     /// not drawn; read it with `text`.
     pub const Screenshot = struct {
         width: u32,
@@ -59,8 +60,9 @@ pub const Emulator = struct {
             .terminal = try .init(io, gpa, .{
                 .cols = size.cols,
                 .rows = size.rows,
-                // The library default (10 MB) is smaller than one full-screen page.
-                .kitty_image_storage_limit = 1024 * 1024 * 1024,
+                // Ghostty's default rather than the library's 10 MB, so images
+                // a real terminal would evict go missing here too.
+                .kitty_image_storage_limit = 320 * 1000 * 1000,
                 .kitty_image_loading_limits = .{ .file = false, .temporary_file = .disabled, .shared_memory = true },
             }),
             .stream = undefined,
@@ -93,6 +95,15 @@ pub const Emulator = struct {
         gpa.destroy(emulator);
     }
 
+    pub fn resize(emulator: *Emulator, size: terminal.Size) !void {
+        try emulator.terminal.resize(emulator.gpa, .{
+            .cols = size.cols,
+            .rows = size.rows,
+            .cell_size_px = .{ .width = size.cell_width, .height = size.cell_height },
+        });
+        emulator.size = size;
+    }
+
     /// The screen's text, one line per row. Caller owns the result.
     pub fn text(emulator: *Emulator, gpa: std.mem.Allocator) ![]const u8 {
         return emulator.terminal.plainString(gpa);
@@ -103,7 +114,7 @@ pub const Emulator = struct {
         const width = @as(u32, size.cols) * size.cell_width;
         const height = @as(u32, size.rows) * size.cell_height;
         const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
-        for (0..pixels.len / 4) |i| pixels[i * 4 ..][0..4].* = .{ 32, 32, 32, 255 };
+        @memset(pixels, 0);
 
         const screen = emulator.terminal.screens.active;
         var placements = screen.kitty_images.placements.iterator();

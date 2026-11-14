@@ -18,10 +18,13 @@ const terminal = @import("../terminal/main.zig");
 /// A tile is at most 8 MiB of RGBA.
 pub const tile_width = 2048;
 pub const tile_height = 1024;
-pub const tile_bytes_max = tile_width * tile_height * 4;
-/// Tiles a layout lists, visible and wanted alike. Bounds the terminal
-/// memory a frame keeps in use to `tiles_max * tile_bytes_max`.
-pub const tiles_max = 32;
+const tile_bytes_max = tile_width * tile_height * 4;
+/// Tiles a layout lists, visible and wanted alike. Zoomed out, a tall view
+/// shows over a hundred small pages, each its own tile.
+pub const tiles_max = 256;
+/// Pixel bytes of the tiles a layout lists, which bounds the terminal memory
+/// a frame keeps in use. Room for 32 full tiles, far more than one screen.
+pub const wanted_bytes_max = 32 * tile_bytes_max;
 /// Pages are never rendered wider, which keeps pixel offsets far from
 /// overflowing and rendering cost per page bounded.
 pub const page_width_max = 16384;
@@ -94,6 +97,7 @@ pub const Tiles = struct {
     slices_len: u32,
     wanted_buffer: [tiles_max]Tile,
     wanted_len: u32,
+    wanted_bytes: u64,
 
     pub fn slices(tiles: *const Tiles) []const Slice {
         return tiles.slices_buffer[0..tiles.slices_len];
@@ -195,7 +199,7 @@ pub const Geometry = struct {
 
     /// The page whose area, including the gap below it, contains `offset`;
     /// the first or last page for offsets beyond the document.
-    fn pageAt(geometry: Geometry, offset: i64) u32 {
+    pub fn pageAt(geometry: Geometry, offset: i64) u32 {
         std.debug.assert(geometry.page_sizes.len > 0);
         // The first page starting after `offset`, minus one.
         var low: u32 = 0;
@@ -215,6 +219,7 @@ pub const Geometry = struct {
 pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, tiles: *Tiles) void {
     tiles.slices_len = 0;
     tiles.wanted_len = 0;
+    tiles.wanted_bytes = 0;
     if (geometry.page_sizes.len == 0 or geometry.view_height == 0) return;
 
     const top = geometry.offsetOf(anchor);
@@ -277,9 +282,11 @@ fn addTiles(geometry: Geometry, version: Version, origin: Origin, start: i64, en
 /// Returns false once the list is full.
 fn addWanted(tiles: *Tiles, tile: Tile) bool {
     for (tiles.wanted()) |other| if (std.meta.eql(other, tile)) return true;
-    if (tiles.wanted_len == tiles_max) return false;
+    const tile_bytes = @as(u64, tile.width()) * tile.height() * 4;
+    if (tiles.wanted_len == tiles_max or tiles.wanted_bytes + tile_bytes > wanted_bytes_max) return false;
     tiles.wanted_buffer[tiles.wanted_len] = tile;
     tiles.wanted_len += 1;
+    tiles.wanted_bytes += tile_bytes;
     return true;
 }
 
@@ -395,12 +402,28 @@ test "anchors round-trip through offsets and clamp to the document" {
     try std.testing.expectEqual(geometry.content_height - 500, geometry.offsetOf(geometry.anchorAt(1 << 40)));
 }
 
-test "the tile limit bounds the work for many tiny pages" {
+test "every visible page is drawn, however many fit on screen" {
+    // 2 px tall pages, so 36 fit in the 500 px view.
     const pages: [500]pdf.Size = @splat(.{ .width = 400, .height = 1 });
     const offsets = testOffsets(&pages);
     const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     var tiles: Tiles = undefined;
     layout(geometry, .{ .page = 0, .y = 0 }, 0, test_version, &tiles);
-    try std.testing.expectEqual(tiles_max, tiles.wanted_len);
-    try std.testing.expect(tiles.slices_len <= tiles_max);
+    try std.testing.expectEqual(36, tiles.slices_len);
+    try std.testing.expect(tiles.wanted_len <= tiles_max);
+}
+
+test "the wanted tiles stay within the memory bound" {
+    // Zoomed in on long pages, the screens above and below need far more
+    // full tiles than are allowed.
+    const pages: [4]pdf.Size = @splat(.{ .width = 400, .height = 4000 });
+    const offsets = testOffsets(&pages);
+    const tall: terminal.Size = .{ .cols = 400, .rows = 200, .cell_width = 10, .cell_height = 20 };
+    const geometry: Geometry = .init(&pages, &offsets, tall, 8);
+    var tiles: Tiles = undefined;
+    layout(geometry, geometry.anchorAt(100_000), 0, test_version, &tiles);
+    try std.testing.expect(tiles.slices_len > 0);
+    var bytes: u64 = 0;
+    for (tiles.wanted()) |tile| bytes += @as(u64, tile.width()) * tile.height() * 4;
+    try std.testing.expect(bytes <= wanted_bytes_max);
 }

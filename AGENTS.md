@@ -82,6 +82,9 @@ empty ones:
   `zig build harness -Doptimize=ReleaseFast -- <file.pdf> --keys '3G<C-d>+'`.
   It runs the viewer in the emulated terminal, presses the keys, prints the
   screen's text and writes a screenshot of its images to `zig-out/screen.png`.
+  Add `--fuzz 300 --seed N` to press random keys and resizes instead,
+  checking the screen against a fresh viewer's; failures are reproducible
+  from the seed.
 - For behaviour that needs a real terminal (raw mode, resizing, detection in
   an actual emulator), run ptz in a background Rex tab and read it with
   `rex capture`; Rex captures text only.
