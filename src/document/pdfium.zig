@@ -1,7 +1,7 @@
 //! Hand-written declarations for the subset of PDFium's C API that ptz uses,
 //! mirroring `public/fpdfview.h`. Declared by hand rather than translated
 //! from the headers because the surface is small and this lets the types
-//! state nullability and opaqueness precisely. Only `main.zig` in this
+//! state nullability and opaqueness precisely. Only `pdf.zig` in this
 //! directory should use these.
 //!
 //! None of these functions are thread-safe; callers must serialize all calls.

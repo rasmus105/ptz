@@ -19,7 +19,7 @@ pub const Options = struct {
     watch: bool = true,
     protocol: Protocol = .auto,
 
-    pub const positional = .{ .file = "PDF file to open" };
+    pub const positional = .{ .file = "PDF or image file to open" };
     pub const shorts = .{ .page = 'p', .dark = 'd' };
     pub const help = .{
         .page = "Open at page N",
@@ -31,7 +31,7 @@ pub const Options = struct {
 
 const Cli = argparse.Cli(Options, .{
     .name = "ptz",
-    .summary = "Render PDFs in the terminal",
+    .summary = "Render PDFs and images in the terminal",
     .version = build_options.version,
     .examples = &.{ "ptz paper.pdf", "ptz -p 3 thesis.pdf" },
 });

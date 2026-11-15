@@ -83,6 +83,9 @@ fn createModule(
         .optimize = optimize,
         .link_libc = true,
     });
+    module.addIncludePath(b.path("vendor/stb"));
+    module.addCSourceFile(.{ .file = b.path("src/document/stb_image.c"), .flags = &.{"-std=c11"} });
+    if (target.result.os.tag == .linux) module.linkSystemLibrary("m", .{});
     if (pdfium) |dep| {
         module.addLibraryPath(dep.path("lib"));
         module.linkSystemLibrary("pdfium", .{ .use_pkg_config = .no });

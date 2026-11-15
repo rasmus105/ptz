@@ -1,6 +1,6 @@
 # ptz
 
-Terminal PDF viewer written in Zig 0.17.
+Terminal PDF and image viewer written in Zig 0.17.
 
 ## Architecture
 
@@ -8,8 +8,8 @@ Terminal PDF viewer written in Zig 0.17.
   frames (which tile slices go where, which tiles to render) out.
 - `app/`: the I/O shell: event loop, render thread (`Renderer`), the tiles
   uploaded to the terminal (`Cache`).
-- `pdf/`, `graphics/`, `terminal/`: engine-neutral wrappers around PDFium, the
-  kitty graphics protocol and the terminal.
+- `document/`, `graphics/`, `terminal/`: engine-neutral wrappers around PDFium
+  and stb_image, the kitty graphics protocol and the terminal.
 
 ## Code style
 

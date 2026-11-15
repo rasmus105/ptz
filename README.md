@@ -1,8 +1,7 @@
 # About
 
-Vibe-coded command line executable to render pdfs in the terminal.
-
-**Currently only supports kitty graphics protocol.**
+Vibe-coded CLI tool to render PDFs and raster images in the terminal using the
+Kitty graphics protocol.
 
 **Install:**
 ```bash
@@ -15,10 +14,12 @@ brew upgrade ptz
 ptz [options] <file>
 
 ptz my-document.pdf
+ptz photo.jpg
 ```
 
 ## Features
 
+- PDF, PNG, JPEG, GIF (first frame), BMP, TGA, PSD, HDR and binary PGM/PPM
 - Vim-like motions (`j/k` + `Ctrl+u/d` for scrolling, `h/l` for next/prev page,
   `:` for command line,...)
 - Continuous scrolling, zoom and panning
@@ -43,3 +44,10 @@ ptz my-document.pdf
 | `q`, `Ctrl-c` | Quit |
 
 Counts work as in Vim, e.g. `5j` or `3l`.
+
+## Dependencies
+
+- [stb_image](https://github.com/nothings/stb/blob/master/stb_image.h): raster image decoding
+- [PDFium](https://pdfium.googlesource.com/pdfium/)
+- [Ghostty VT](https://github.com/ghostty-org/ghostty) (only for testing
+  purposes)

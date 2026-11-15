@@ -12,7 +12,7 @@ const std = @import("std");
 
 // project
 const graphics = @import("../graphics/main.zig");
-const pdf = @import("../pdf/main.zig");
+const document = @import("../document/main.zig");
 const terminal = @import("../terminal/main.zig");
 const viewer = @import("../viewer/main.zig");
 
@@ -58,7 +58,7 @@ pub const App = struct {
     renderer: Renderer,
     cache: Cache,
     /// The loaded document's page sizes and offsets, which `state` points to.
-    page_sizes: []pdf.Size,
+    page_sizes: []document.Size,
     page_offsets: []f64,
     frame: viewer.Frame,
     results: std.ArrayList(Renderer.Result),
@@ -71,7 +71,7 @@ pub const App = struct {
     /// Whether text drawn at an earlier window size must be erased.
     resized: bool,
     /// Set when the document can't be loaded and there is nothing to show.
-    open_error: ?pdf.Error,
+    open_error: ?document.Error,
 
     /// Initialized in place: the renderer must not move once started.
     pub fn init(
@@ -461,7 +461,7 @@ test "shows the document, and keys move through it" {
     const app = try gpa.create(App);
     defer gpa.destroy(app);
     app.init(std.testing.io, gpa, .{
-        .path = "src/pdf/testdata/red-square.pdf",
+        .path = "src/document/testdata/red-square.pdf",
         .page = 1,
         .dark = false,
         .watch = false,
@@ -523,7 +523,7 @@ test "an empty file stays open and reloads when PDF content arrives" {
     try std.testing.expect(!app.input("jG+-"));
     try app.settle(&emulator.output);
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "empty.pdf", .data = @embedFile("../pdf/testdata/red-square.pdf") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "empty.pdf", .data = @embedFile("../document/testdata/red-square.pdf") });
     const current = Watch.stamp(io, path).?;
     try std.testing.expect(!watch.observe(current));
     try std.testing.expect(watch.observe(current));
@@ -543,7 +543,7 @@ test "navigation sequences survive every input split without closing commands" {
     defer gpa.destroy(reference);
     const fragmented = try gpa.create(App);
     defer gpa.destroy(fragmented);
-    const pages = [_]pdf.Size{.{ .width = 200, .height = 1000 }};
+    const pages = [_]document.Size{.{ .width = 200, .height = 1000 }};
     const offsets = [_]f64{0};
     for ([_][]const u8{ "\x1b[A", "\x1b[B", "\x1bOC", "\x1b[1;5D", "\x1b[5~", "\x1b[6~", "\x1b[H", "\x1b[F" }) |sequence| {
         for ([_]bool{ false, true }) |command| {
@@ -614,7 +614,7 @@ test "tiles stay on screen through a resize that keeps them" {
     const app = try gpa.create(App);
     defer gpa.destroy(app);
     app.init(std.testing.io, gpa, .{
-        .path = "src/pdf/testdata/red-square.pdf",
+        .path = "src/document/testdata/red-square.pdf",
         .page = 1,
         .dark = false,
         .watch = false,
@@ -632,4 +632,61 @@ test "tiles stay on screen through a resize that keeps them" {
     const screen = try emulator.screenshot(gpa);
     defer gpa.free(screen.pixels);
     try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, screen.pixel(80, 120));
+}
+
+test "images render in the terminal, survive failed reloads, and reload across formats" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "image", .data = @embedFile("../document/testdata/red-square.png") });
+    const path = try tmp.dir.realPathFileAlloc(io, "image", gpa);
+    defer gpa.free(path);
+    const size: terminal.Size = .{ .cols = 40, .rows = 11, .cell_width = 10, .cell_height = 20 };
+    const emulator: *Emulator = try .create(io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(io, gpa, .{ .path = path, .page = 1, .dark = false, .watch = true, .medium = .direct }, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(null, app.open_error);
+    const screen = try emulator.screenshot(gpa);
+    defer gpa.free(screen.pixels);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, screen.pixel(80, 120));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, screen.pixel(300, 40));
+    try std.testing.expect(!app.input("i++j"));
+    try app.settle(&emulator.output);
+    const generation = app.state.document.generation;
+    const zoomed = try emulator.screenshot(gpa);
+    defer gpa.free(zoomed.pixels);
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "image", .data = @embedFile("../document/testdata/red-square.png")[0..40] });
+    app.renderer.reload();
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(generation, app.state.document.generation);
+    try std.testing.expectEqual(null, app.open_error);
+    const unchanged = try emulator.screenshot(gpa);
+    defer gpa.free(unchanged.pixels);
+    try std.testing.expectEqualSlices(u8, zoomed.pixels, unchanged.pixels);
+
+    // Failed loads leave the previous image available even for uncached tiles.
+    try std.testing.expect(!app.input("=igg"));
+    try app.settle(&emulator.output);
+    const retained = try emulator.screenshot(gpa);
+    defer gpa.free(retained.pixels);
+    try std.testing.expectEqualSlices(u8, screen.pixels, retained.pixels);
+
+    for ([_][]const u8{
+        @embedFile("../document/testdata/red-square.pdf"),
+        @embedFile("../document/testdata/red-square.png"),
+    }, 1..) |bytes, index| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "image", .data = bytes });
+        app.renderer.reload();
+        try app.settle(&emulator.output);
+        try std.testing.expectEqual(generation + @as(u32, @intCast(index)), app.state.document.generation);
+        const reloaded = try emulator.screenshot(gpa);
+        defer gpa.free(reloaded.pixels);
+        try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, reloaded.pixel(80, 120));
+    }
 }

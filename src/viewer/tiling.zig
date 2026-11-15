@@ -8,7 +8,7 @@
 const std = @import("std");
 
 // project
-const pdf = @import("../pdf/main.zig");
+const document = @import("../document/main.zig");
 const terminal = @import("../terminal/main.zig");
 
 // ====================================================================================================
@@ -124,7 +124,7 @@ const Origin = struct {
 
 /// The document's layout at one zoom and window size.
 pub const Geometry = struct {
-    page_sizes: []const pdf.Size,
+    page_sizes: []const document.Size,
     /// Each page's distance from the first page's top, in points, without
     /// gaps; see `viewer.Document`.
     page_offsets: []const f64,
@@ -137,7 +137,7 @@ pub const Geometry = struct {
     content_width: u32,
     content_height: i64,
 
-    pub fn init(page_sizes: []const pdf.Size, page_offsets: []const f64, size: terminal.Size, zoom: f32) Geometry {
+    pub fn init(page_sizes: []const document.Size, page_offsets: []const f64, size: terminal.Size, zoom: f32) Geometry {
         std.debug.assert(zoom > 0);
         std.debug.assert(page_offsets.len == page_sizes.len);
         std.debug.assert(size.cols > 0 and size.cell_width > 0 and size.cell_height > 0);
@@ -322,7 +322,7 @@ const test_size: terminal.Size = .{ .cols = 80, .rows = 26, .cell_width = 10, .c
 const test_version: Version = .{ .generation = 1, .dark = false };
 
 /// Offsets for pages of these sizes, as `viewer.Document` defines them.
-fn testOffsets(comptime pages: []const pdf.Size) [pages.len]f64 {
+fn testOffsets(comptime pages: []const document.Size) [pages.len]f64 {
     var offsets: [pages.len]f64 = undefined;
     var offset: f64 = 0;
     for (pages, &offsets) |page, *page_offset| {
@@ -334,7 +334,7 @@ fn testOffsets(comptime pages: []const pdf.Size) [pages.len]f64 {
 
 test "pages fill the width and are cut into tiles at the view's edges" {
     // Two 400x700 pt pages at 2 px/pt: 800x1400 px, so two tile rows each.
-    const pages: [2]pdf.Size = @splat(.{ .width = 400, .height = 700 });
+    const pages: [2]document.Size = @splat(.{ .width = 400, .height = 700 });
     const offsets = testOffsets(&pages);
     const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     try std.testing.expectEqual(2, geometry.scale);
@@ -370,7 +370,7 @@ test "pages fill the width and are cut into tiles at the view's edges" {
 }
 
 test "narrow content is centred, and only visible columns of wide content are used" {
-    const pages = [_]pdf.Size{.{ .width = 400, .height = 100 }};
+    const pages = [_]document.Size{.{ .width = 400, .height = 100 }};
     const offsets = testOffsets(&pages);
     var tiles: Tiles = undefined;
 
@@ -388,7 +388,7 @@ test "narrow content is centred, and only visible columns of wide content are us
 }
 
 test "anchors round-trip through offsets and clamp to the document" {
-    const pages = [_]pdf.Size{ .{ .width = 400, .height = 700 }, .{ .width = 300, .height = 700 } };
+    const pages = [_]document.Size{ .{ .width = 400, .height = 700 }, .{ .width = 300, .height = 700 } };
     const offsets = testOffsets(&pages);
     const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     try std.testing.expectEqual(1400 + gap + 1400, geometry.content_height);
@@ -404,7 +404,7 @@ test "anchors round-trip through offsets and clamp to the document" {
 
 test "every visible page is drawn, however many fit on screen" {
     // 2 px tall pages, so 36 fit in the 500 px view.
-    const pages: [500]pdf.Size = @splat(.{ .width = 400, .height = 1 });
+    const pages: [500]document.Size = @splat(.{ .width = 400, .height = 1 });
     const offsets = testOffsets(&pages);
     const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     var tiles: Tiles = undefined;
@@ -416,7 +416,7 @@ test "every visible page is drawn, however many fit on screen" {
 test "the wanted tiles stay within the memory bound" {
     // Zoomed in on long pages, the screens above and below need far more
     // full tiles than are allowed.
-    const pages: [4]pdf.Size = @splat(.{ .width = 400, .height = 4000 });
+    const pages: [4]document.Size = @splat(.{ .width = 400, .height = 4000 });
     const offsets = testOffsets(&pages);
     const tall: terminal.Size = .{ .cols = 400, .rows = 200, .cell_width = 10, .cell_height = 20 };
     const geometry: Geometry = .init(&pages, &offsets, tall, 8);

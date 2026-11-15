@@ -13,7 +13,7 @@
 const std = @import("std");
 
 // project
-const pdf = @import("../pdf/main.zig");
+const document = @import("../document/main.zig");
 const terminal = @import("../terminal/main.zig");
 
 // local
@@ -49,7 +49,7 @@ pub const Document = struct {
     /// Identifies this load; tiles carry it so that tiles of another load
     /// are never mistaken for current ones.
     generation: u32,
-    page_sizes: []const pdf.Size,
+    page_sizes: []const document.Size,
     /// Each page's distance from the first page's top, in points, without
     /// the gaps between pages: the running sum of page heights. Computed
     /// once per load, so layouts at any zoom are cheap.
@@ -161,12 +161,12 @@ pub const State = struct {
                 state.size = size;
                 state.relayout();
             },
-            .document => |document| {
-                std.debug.assert(document.page_offsets.len == document.page_sizes.len);
-                std.debug.assert(document.generation > state.document.generation);
+            .document => |doc| {
+                std.debug.assert(doc.page_offsets.len == doc.page_sizes.len);
+                std.debug.assert(doc.generation > state.document.generation);
                 // Clears e.g. an earlier "reload failed".
                 state.message_len = 0;
-                state.document = document;
+                state.document = doc;
                 state.relayout();
             },
             .message => |text| {
@@ -366,7 +366,7 @@ test {
 
 const test_size: terminal.Size = .{ .cols = 80, .rows = 25, .cell_width = 10, .cell_height = 20 };
 /// An 800x480 px view; A4 pages fit to 800 px wide are about 1132 px tall.
-const test_pages: [3]pdf.Size = @splat(.{ .width = 595, .height = 842 });
+const test_pages: [3]document.Size = @splat(.{ .width = 595, .height = 842 });
 const test_offsets = [_]f64{ 0, 842, 2 * 842 };
 
 const TestViewer = struct {
@@ -495,7 +495,7 @@ test "a reload keeps the position, clamped to the new page count" {
 }
 
 test "jumping to a narrower page brings it into view" {
-    const pages = [_]pdf.Size{ .{ .width = 2000, .height = 100 }, .{ .width = 200, .height = 100 } };
+    const pages = [_]document.Size{ .{ .width = 2000, .height = 100 }, .{ .width = 200, .height = 100 } };
     const offsets = [_]f64{ 0, 100 };
     var state: State = .init("doc.pdf", test_size, false, 1);
     _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &pages, .page_offsets = &offsets } });
@@ -512,7 +512,7 @@ test "jumping to a narrower page brings it into view" {
 }
 
 test "scrolling onto a narrower page brings it into view" {
-    const pages = [_]pdf.Size{ .{ .width = 2000, .height = 100 }, .{ .width = 200, .height = 100 } };
+    const pages = [_]document.Size{ .{ .width = 2000, .height = 100 }, .{ .width = 200, .height = 100 } };
     const offsets = [_]f64{ 0, 100 };
     var state: State = .init("doc.pdf", test_size, false, 1);
     _ = state.update(.{ .document = .{ .generation = 1, .page_sizes = &pages, .page_offsets = &offsets } });

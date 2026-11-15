@@ -75,7 +75,7 @@ const Options = struct {
     seed: u64 = 0,
     direct: bool = false,
 
-    pub const positional = .{ .file = "PDF file to open" };
+    pub const positional = .{ .file = "PDF or image file to open" };
     pub const shorts = .{ .page = 'p', .keys = 'k', .out = 'o' };
     pub const help = .{
         .page = "Page to open at",

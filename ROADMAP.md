@@ -21,8 +21,9 @@
 
 ## v0.3.0 - Extended support
 
-- [ ] Support more formats (epub, xps, cbz)
-- [ ] Support images (svg, png, jpeg)
+- [x] Support raster image formats
+- [ ] More document formats (epub, xps, cbz)
+- [ ] SVG
 
 ## vX.Y.Z
 

@@ -11,7 +11,7 @@ const std = @import("std");
 
 // project
 const graphics = @import("../graphics/main.zig");
-const pdf = @import("../pdf/main.zig");
+const document = @import("../document/main.zig");
 const viewer = @import("../viewer/main.zig");
 
 // aliases
@@ -24,8 +24,8 @@ const Tile = viewer.Tile;
 
 pub const Result = union(enum) {
     /// The document was (re)loaded; owns the slices. See `viewer.Document`.
-    opened: struct { generation: u32, page_sizes: []pdf.Size, page_offsets: []f64 },
-    open_failed: pdf.Error,
+    opened: struct { generation: u32, page_sizes: []document.Size, page_offsets: []f64 },
+    open_failed: document.Error,
     tile: struct { tile: Tile, encoded: graphics.Encoded },
     render_failed: Tile,
 
@@ -65,7 +65,7 @@ results: std.ArrayList(Result),
 stopping: bool,
 
 // Only used by whoever runs `step`:
-document: ?pdf.Document,
+doc: ?document.Document,
 /// Counts successful loads; tiles of any other generation are skipped.
 generation: u32,
 
@@ -97,7 +97,7 @@ pub fn init(
         .rendering = null,
         .results = .empty,
         .stopping = false,
-        .document = null,
+        .doc = null,
         .generation = 0,
     };
 }
@@ -110,7 +110,7 @@ pub fn deinit(renderer: *Renderer) void {
         renderer.mutex.unlock(renderer.io);
         thread.join();
     }
-    if (renderer.document) |*document| document.close();
+    if (renderer.doc) |*doc| doc.close();
     for (renderer.results.items) |result| result.deinit(renderer.gpa);
     renderer.results.deinit(renderer.gpa);
     renderer.* = undefined;
@@ -217,26 +217,26 @@ fn run(renderer: *Renderer) void {
 }
 
 fn load(renderer: *Renderer) Result {
-    var document = pdf.Document.open(renderer.io, renderer.gpa, renderer.path) catch |err|
+    var doc = document.Document.open(renderer.io, renderer.gpa, renderer.path) catch |err|
         return .{ .open_failed = err };
-    const page_count = document.pageCount();
-    const page_sizes = renderer.gpa.alloc(pdf.Size, page_count) catch {
-        document.close();
+    const page_count = doc.pageCount();
+    const page_sizes = renderer.gpa.alloc(document.Size, page_count) catch {
+        doc.close();
         return .{ .open_failed = error.OutOfMemory };
     };
     const page_offsets = renderer.gpa.alloc(f64, page_count) catch {
         renderer.gpa.free(page_sizes);
-        document.close();
+        doc.close();
         return .{ .open_failed = error.OutOfMemory };
     };
     var offset: f64 = 0;
     for (page_sizes, page_offsets, 0..) |*size, *page_offset, page| {
-        size.* = document.pageSize(@intCast(page)) catch .{ .width = pdf.page_size_min, .height = pdf.page_size_min };
+        size.* = doc.pageSize(@intCast(page)) catch .{ .width = document.page_size_min, .height = document.page_size_min };
         page_offset.* = offset;
         offset += size.height;
     }
-    if (renderer.document) |*old| old.close();
-    renderer.document = document;
+    if (renderer.doc) |*old| old.close();
+    renderer.doc = doc;
     renderer.generation += 1;
     return .{ .opened = .{ .generation = renderer.generation, .page_sizes = page_sizes, .page_offsets = page_offsets } };
 }
@@ -245,12 +245,12 @@ fn load(renderer: *Renderer) Result {
 /// load of the document than the current one.
 fn render(renderer: *Renderer, tile: Tile) ?Result {
     if (tile.generation != renderer.generation) return null;
-    const document = &(renderer.document orelse return null);
+    const doc = &(renderer.doc orelse return null);
 
     // Render straight into what will be uploaded.
     const canvas = graphics.Canvas.init(renderer.gpa, renderer.medium, tile.width(), tile.height()) catch
         return .{ .render_failed = tile };
-    document.render(tile.page, .{
+    doc.render(tile.page, .{
         .page_width = tile.page_width,
         .page_height = tile.page_height,
         .x = tile.left(),
@@ -295,7 +295,7 @@ fn expectCollected(renderer: *Renderer, results: *std.ArrayList(Result)) !void {
 test "loads, then renders wanted tiles of the loaded version only" {
     const gpa = std.testing.allocator;
     var renderer: Renderer = undefined;
-    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    renderer.init(std.testing.io, gpa, "src/document/testdata/red-square.pdf", .direct, null);
     defer renderer.deinit();
     var results: std.ArrayList(Result) = .empty;
     defer {
@@ -321,7 +321,7 @@ test "loads, then renders wanted tiles of the loaded version only" {
 test "a finished but uncollected tile is not queued again" {
     const gpa = std.testing.allocator;
     var renderer: Renderer = undefined;
-    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    renderer.init(std.testing.io, gpa, "src/document/testdata/red-square.pdf", .direct, null);
     defer renderer.deinit();
     _ = renderer.step();
     renderer.want(&.{test_tile});
@@ -339,7 +339,7 @@ test "on its thread, results wake the UI, and deinit stops it while busy" {
         _ = std.c.close(fd);
     };
     var renderer: Renderer = undefined;
-    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, fds[1]);
+    renderer.init(std.testing.io, gpa, "src/document/testdata/red-square.pdf", .direct, fds[1]);
     defer renderer.deinit();
     try renderer.start();
 
@@ -403,7 +403,7 @@ test "collection during a load does not lose its result" {
             .free = DuringLoad.free,
         },
     };
-    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    renderer.init(std.testing.io, gpa, "src/document/testdata/red-square.pdf", .direct, null);
     defer renderer.deinit();
     defer {
         for (context.results.items) |result| result.deinit(gpa);
@@ -423,7 +423,7 @@ test "collection failure preserves the loaded generation for retry" {
     var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
     const gpa = failing.allocator();
     var renderer: Renderer = undefined;
-    renderer.init(std.testing.io, gpa, "src/pdf/testdata/red-square.pdf", .direct, null);
+    renderer.init(std.testing.io, gpa, "src/document/testdata/red-square.pdf", .direct, null);
     defer renderer.deinit();
     var results: std.ArrayList(Result) = .empty;
     defer {

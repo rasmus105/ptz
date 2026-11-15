@@ -60,7 +60,7 @@ pub fn main(init: std.process.Init) !void {
         error.IsDir => fail("cannot open '{s}': is a directory", .{options.file}),
         error.AccessDenied => fail("cannot open '{s}': permission denied", .{options.file}),
         error.FileTooBig => fail("cannot open '{s}': file too big", .{options.file}),
-        error.InvalidFormat => fail("cannot open '{s}': not a PDF file, or corrupted", .{options.file}),
+        error.InvalidFormat => fail("cannot open '{s}': unsupported or corrupted document", .{options.file}),
         error.PasswordRequired => fail("cannot open '{s}': password protected", .{options.file}),
         error.UnsupportedSecurity => fail("cannot open '{s}': unsupported encryption", .{options.file}),
         else => return err,
@@ -90,7 +90,7 @@ test {
     _ = @import("argparse.zig");
     _ = app;
     _ = graphics;
-    _ = @import("pdf/main.zig");
+    _ = @import("document/main.zig");
     _ = terminal;
     _ = @import("viewer/main.zig");
 }
