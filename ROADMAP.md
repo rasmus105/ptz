@@ -14,14 +14,15 @@
 
 ## v0.2.0 - Polishing
 
-- [ ] Search (`/`, `n/N`)
-- [ ] Non-interactive mode
-- [ ] TOC (see Sioyek)
-- [ ] Jumps (`Ctrl+o/i`)
+- [x] Search (`/`, `n/N`)
+- [x] Non-interactive mode
+- [x] Searchable TOC (`t`)
+- [x] Jumps (`Ctrl+o/i`)
 
 ## v0.3.0 - Extended support
 
 - [ ] Support more formats (epub, xps, cbz)
+- [ ] Support images (svg, png, jpeg)
 
 ## vX.Y.Z
 
