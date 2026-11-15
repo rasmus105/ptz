@@ -213,7 +213,7 @@ fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size
         // A busy render thread finishes a few results at most between keys.
         for (0..random.uintAtMost(u32, 3)) |_| {
             _ = viewer.renderer.step();
-            viewer.collect();
+            try viewer.collect();
             if (random.boolean()) try viewer.draw(&emulator.output);
         }
         if (viewer.dirty) try viewer.draw(&emulator.output);
