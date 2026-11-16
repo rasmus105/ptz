@@ -1,0 +1,18 @@
+MuPDF 1.28.6: preserve source-row order when scaling a single-column image.
+
+The specialized single-column scaler reads source rows directly. Reordering
+its weights for the general scaler's vertical ring buffer swaps colours.
+The image colour-order and tile-equivalence regressions cover this path.
+
+--- a/source/fitz/draw-scale-simple.c
++++ b/source/fitz/draw-scale-simple.c
+@@ -1762,7 +1762,8 @@
+ 			contrib_rows = NULL;
+ 		else
+ #endif /* SINGLE_PIXEL_SPECIALS */
+-			contrib_rows = Memento_label(make_weights(ctx, src->h, y, h, filter, 1, dst_h_int, patch.y0, patch.y1, src->n, flip_y, cache_y), "contrib_rows");
++			/* ptz (2026-11-16): single-column samples bypass the vertical ring buffer. */
++			contrib_rows = Memento_label(make_weights(ctx, src->h, y, h, filter, src->w != 1, dst_h_int, patch.y0, patch.y1, src->n, flip_y, cache_y), "contrib_rows");
+ 
+ 		output = fz_new_pixmap(ctx, src->colorspace, patch.x1 - patch.x0, patch.y1 - patch.y0, src->seps, src->alpha || forcealpha);
+ 	}

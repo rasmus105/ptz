@@ -1,8 +1,7 @@
 //! Kitty graphics protocol: https://sw.kovidgoyal.net/kitty/graphics-protocol/
 //!
-//! Every command carries `q=2`, which stops the terminal from replying:
-//! nothing reads replies while viewing, and they would otherwise arrive as
-//! typed input. The exception is the support query, which needs its reply.
+//! Uploads and placements request errors only (`q=1`). A terminal can evict
+//! cached images independently, so a missing-image reply must reach the app.
 
 // std
 const std = @import("std");
@@ -75,7 +74,7 @@ pub fn transmit(writer: *std.Io.Writer, id: graphics.ImageId, encoded: graphics.
         .direct => |base64| base64,
         .shared_memory => |*name| {
             var encoded_name: [std.base64.standard.Encoder.calcSize(@sizeOf(shm.Name))]u8 = undefined;
-            try writer.print("\x1b_Ga=t,t=s,f=32,i={d},s={d},v={d},S={d},q=2;{s}\x1b\\", .{
+            try writer.print("\x1b_Ga=t,t=s,f=32,i={d},s={d},v={d},S={d},q=1;{s}\x1b\\", .{
                 id,
                 encoded.width,
                 encoded.height,
@@ -94,7 +93,7 @@ pub fn transmit(writer: *std.Io.Writer, id: graphics.ImageId, encoded: graphics.
         const more = @intFromBool(rest.len > 0);
         if (first) {
             try writer.print(
-                "\x1b_Ga=t,f=32,o=z,i={d},s={d},v={d},q=2,m={d};",
+                "\x1b_Ga=t,f=32,o=z,i={d},s={d},v={d},q=1,m={d};",
                 .{ id, encoded.width, encoded.height, more },
             );
         } else {
@@ -112,7 +111,7 @@ pub fn place(writer: *std.Io.Writer, placement: graphics.Placement) std.Io.Write
     const source = placement.source;
     try terminal.moveCursor(writer, placement.row, placement.col);
     try writer.print(
-        "\x1b_Ga=p,i={d},p=1,x={d},y={d},w={d},h={d},X={d},Y={d},C=1,q=2\x1b\\",
+        "\x1b_Ga=p,i={d},p=1,x={d},y={d},w={d},h={d},X={d},Y={d},C=1,q=1\x1b\\",
         .{ placement.image, source.x, source.y, source.width, source.height, placement.x_offset, placement.y_offset },
     );
 }
@@ -125,6 +124,30 @@ pub fn clearPlacements(writer: *std.Io.Writer) std.Io.Writer.Error!void {
 /// Deletes an image and frees its memory in the terminal.
 pub fn free(writer: *std.Io.Writer, id: graphics.ImageId) std.Io.Writer.Error!void {
     try writer.print("\x1b_Ga=d,d=I,i={d},q=2\x1b\\", .{id});
+}
+
+/// Parses a complete APC response; input framing and bounded buffering belong
+/// to the caller so oversized strings cannot become keystrokes.
+pub fn parseReply(bytes: []const u8) ?graphics.Reply {
+    if (!std.mem.startsWith(u8, bytes, "\x1b_G") or !std.mem.endsWith(u8, bytes, "\x1b\\")) return null;
+    const content = bytes[3 .. bytes.len - 2];
+    const separator = std.mem.indexOfScalar(u8, content, ';') orelse return null;
+    var image: ?graphics.ImageId = null;
+    var placement: ?u32 = null;
+    var fields = std.mem.splitScalar(u8, content[0..separator], ',');
+    while (fields.next()) |field| {
+        if (std.mem.startsWith(u8, field, "i=")) {
+            image = std.fmt.parseInt(graphics.ImageId, field[2..], 10) catch return null;
+        } else if (std.mem.startsWith(u8, field, "p=")) {
+            placement = std.fmt.parseInt(u32, field[2..], 10) catch return null;
+        }
+    }
+    const message = content[separator + 1 ..];
+    return .{
+        .image = image orelse return null,
+        .placement = placement,
+        .status = if (std.mem.eql(u8, message, "OK")) .ok else if (std.mem.startsWith(u8, message, "ENOENT:")) .not_found else .rejected,
+    };
 }
 
 // ====================================================================================================
@@ -182,7 +205,7 @@ fn expectRoundTrip(width: u32, pixels: []const u8, chunks_min: usize, expected_k
 
 test "small image is sent as a single escape sequence" {
     const pixels = [_]u8{ 0xff, 0x00, 0x00, 0xff };
-    try expectRoundTrip(1, &pixels, 1, "a=t,f=32,o=z,i=7,s=1,v=1,q=2,m=0");
+    try expectRoundTrip(1, &pixels, 1, "a=t,f=32,o=z,i=7,s=1,v=1,q=1,m=0");
 }
 
 test "large image is split into chunks that reassemble to the pixels" {

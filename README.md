@@ -1,6 +1,6 @@
 # About
 
-Vibe-coded CLI tool to render PDFs and raster images in the terminal using the
+Vibe-coded CLI tool to render documents and images in the terminal using the
 Kitty graphics protocol.
 
 **Install:**
@@ -14,12 +14,15 @@ brew upgrade ptz
 ptz [options] <file>
 
 ptz my-document.pdf
+ptz book.epub
 ptz photo.jpg
 ```
 
 ## Features
 
-- PDF, PNG, JPEG, GIF (first frame), BMP, TGA, PSD, HDR and binary PGM/PPM
+- PDF, EPUB (DRM-free), XPS, CBZ/CBT, FB2, MOBI and SVG (MuPDF's supported subset)
+- PNG, JPEG, TIFF, JPEG 2000, BMP, PSD, GIF (static) and PNM/PAM; multipage
+  images expose each page
 - Vim-like motions (`j/k` + `Ctrl+u/d` for scrolling, `h/l` for next/prev page,
   `:` for command line,...)
 - Continuous scrolling, zoom and panning
@@ -47,7 +50,12 @@ Counts work as in Vim, e.g. `5j` or `3l`.
 
 ## Dependencies
 
-- [stb_image](https://github.com/nothings/stb/blob/master/stb_image.h): raster image decoding
-- [PDFium](https://pdfium.googlesource.com/pdfium/)
+- [MuPDF](https://mupdf.com/): document and image rendering, built from pinned
+  source on the first `zig build` (requires GNU Make, patch and C/C++ compilers)
 - [Ghostty VT](https://github.com/ghostty-org/ghostty) (only for testing
   purposes)
+
+EPUB, FB2 and MOBI use a fixed page layout; resizing and zooming scale those
+pages without changing pagination. Images honor their resolution and orientation.
+
+Licensed under AGPL-3.0-or-later; see [LICENSE](LICENSE) and [NOTICE](NOTICE).

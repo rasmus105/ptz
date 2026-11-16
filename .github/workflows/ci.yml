@@ -10,7 +10,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The platforms ptz ships PDFium builds for (see build.zig.zon).
+        # MuPDF and ptz are built natively on each release platform.
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:

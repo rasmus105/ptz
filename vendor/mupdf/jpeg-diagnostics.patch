@@ -1,0 +1,17 @@
+MuPDF 1.28.6: keep JPEG metadata warnings out of terminal output.
+
+The metadata reader must use the same quiet libjpeg diagnostic callback as
+the full decoder. libjpeg's default callback writes directly to stderr,
+interleaving terminal graphics even when MuPDF callbacks are configured.
+
+--- a/source/fitz/load-jpeg.c
++++ b/source/fitz/load-jpeg.c
+@@ -529,6 +529,8 @@
+ 	cinfo.mem = NULL;
+ 	cinfo.global_state = 0;
+ 	cinfo.err = jpeg_std_error(&err);
++	/* ptz (2026-11-16): metadata warnings must not write to the terminal. */
++	err.output_message = output_message;
+ 	err.error_exit = error_exit;
+ 
+ 	cinfo.client_data = NULL;

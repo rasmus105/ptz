@@ -21,9 +21,8 @@ const Tile = viewer.Tile;
 /// here ("pt") to stay clear of the small ids most programs use.
 const image_id_base: graphics.ImageId = 0x7074_0000;
 
-/// Decoded pixel bytes ptz keeps in the terminal. Kitty's default quota is
-/// 320 MB per screen; staying below it avoids the terminal silently
-/// evicting tiles that are on screen.
+/// Upper bound on decoded pixel bytes tracked as uploaded. Terminals can
+/// enforce a smaller quota; missing-image replies invalidate those entries.
 pub const uploaded_bytes_max = 256 * 1024 * 1024;
 
 /// Pixel bytes of rendered tiles kept while not wanted, e.g. when scrolling
@@ -68,6 +67,11 @@ uploaded_bytes: u64,
 pending_bytes: u64,
 /// Advanced once per frame by `evict`.
 clock: u64,
+visible: [viewer.tiles_max]Tile,
+visible_len: usize,
+/// Recovery is bounded for an unchanged view: a quota smaller than the view
+/// cannot be fixed by endlessly retransmitting the images it just evicted.
+recoveries: usize,
 
 // ====================================================================================================
 // Public API
@@ -85,6 +89,9 @@ pub fn init(uploaded_budget_bytes: u64, pending_budget_bytes: u64) Cache {
         .uploaded_bytes = 0,
         .pending_bytes = 0,
         .clock = 1,
+        .visible = undefined,
+        .visible_len = 0,
+        .recoveries = 0,
     };
 }
 
@@ -113,14 +120,73 @@ pub fn putFailed(cache: *Cache, gpa: std.mem.Allocator, tile: Tile) std.mem.Allo
     if (!slot.found_existing) slot.value_ptr.* = .{ .id = 0, .state = .failed, .last_used = cache.clock };
 }
 
-/// Marks the cached ones of `tiles` as used this frame, and returns the
-/// others in `missing`, in order.
+/// Protects visible uploads before making room for new ones. Prefetch tiles
+/// may be kept decoded without competing for the terminal's image quota.
+pub fn beginFrame(cache: *Cache, visible: []const Tile) void {
+    const previous = cache.visible[0..cache.visible_len];
+    const changed = previous.len != visible.len or changed: {
+        for (previous, visible) |a, b| if (!std.meta.eql(a, b)) break :changed true;
+        break :changed false;
+    };
+    if (changed) {
+        @memcpy(cache.visible[0..visible.len], visible);
+        cache.visible_len = visible.len;
+        cache.recoveries = 0;
+        var index: usize = 0;
+        while (index < cache.entries.count()) {
+            if (cache.entries.values()[index].state == .failed) cache.entries.swapRemoveAt(index) else index += 1;
+        }
+    }
+    for (visible) |tile| _ = cache.shown(tile);
+}
+
+/// Forgets only the failed id. A delayed reply cannot discard a replacement
+/// upload, which receives a fresh id through `put`.
+pub fn reject(cache: *Cache, reply: graphics.Reply) enum { ignored, retry, failed } {
+    if (reply.status == .ok) return .ignored;
+    // Transfers outlive cache eviction, but an error confirms the terminal
+    // has finished trying to read that object even if its tile is gone.
+    var transfer_index: usize = 0;
+    while (transfer_index < cache.transfers.items.len) {
+        if (cache.transfers.items[transfer_index].image == reply.image) {
+            const transfer = cache.transfers.swapRemove(transfer_index);
+            cache.transfer_bytes -= transfer.bytes;
+            transfer.deinit();
+        } else transfer_index += 1;
+    }
+    for (cache.entries.values(), 0..) |*entry, index| {
+        if (entry.id != reply.image or entry.state != .uploaded) continue;
+        const tile = cache.entries.keys()[index];
+        cache.uploaded_bytes -= bytes(tile);
+        var visible = false;
+        for (cache.visible[0..cache.visible_len]) |shown_tile| {
+            if (tile.sameArea(shown_tile)) {
+                visible = true;
+                break;
+            }
+        }
+        if (reply.status == .not_found and reply.placement == 1 and
+            (!visible or cache.recoveries < 2 * cache.visible_len))
+        {
+            cache.entries.swapRemoveAt(index);
+            if (!visible) return .ignored;
+            cache.recoveries += 1;
+            return .retry;
+        }
+        entry.state = .failed;
+        return if (visible) .failed else .ignored;
+    }
+    return .ignored;
+}
+
+/// Marks pending work as used and returns uncached tiles in order. Uploaded
+/// tiles are protected only by `beginFrame`/`shown`, not by prefetch requests.
 pub fn findMissing(cache: *Cache, tiles: []const Tile, missing: []Tile) []Tile {
     std.debug.assert(missing.len >= tiles.len);
     var len: usize = 0;
     for (tiles) |tile| {
         if (cache.entries.getPtr(tile)) |entry| {
-            entry.last_used = cache.clock;
+            if (entry.state != .uploaded) entry.last_used = cache.clock;
         } else {
             missing[len] = tile;
             len += 1;
@@ -129,8 +195,8 @@ pub fn findMissing(cache: *Cache, tiles: []const Tile, missing: []Tile) []Tile {
     return missing[0..len];
 }
 
-/// Uploads the pending ones of `tiles`, in order, until about
-/// `budget_bytes` have been written. Returns whether any are left.
+/// Uploads pending tiles in order, bounding both output bytes and decoded
+/// image bytes by `budget_bytes`. Returns whether uploads remain.
 pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, tiles: []const Tile, budget_bytes: usize) (std.mem.Allocator.Error || std.Io.Writer.Error)!bool {
     var index: usize = 0;
     while (index < cache.transfers.items.len) {
@@ -146,8 +212,9 @@ pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, til
         if (pending.state != .pending) continue;
         const encoded = pending.state.pending;
         // The first upload always goes, so a huge tile can't stall forever.
-        if (written > 0 and written + encoded.transmitLen() > budget_bytes) return true;
-        written += encoded.transmitLen();
+        const cost = @max(encoded.transmitLen(), bytes(tile));
+        if (written > 0 and written + cost > budget_bytes) return true;
+        written += cost;
         if (encoded.data == .shared_memory) {
             // A non-consuming terminal must not leave unlimited kernel memory
             // linked outside the cache's image budgets.
@@ -229,6 +296,8 @@ pub fn clear(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer) void
     cache.transfer_bytes = 0;
     cache.uploaded_bytes = 0;
     cache.pending_bytes = 0;
+    cache.visible_len = 0;
+    cache.recoveries = 0;
 }
 
 // ====================================================================================================

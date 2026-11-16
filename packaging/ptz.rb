@@ -1,9 +1,9 @@
 # Homebrew formula template; the release workflow fills in the @...@ fields
 # and pushes the result to rasmus105/homebrew-tap.
 class Ptz < Formula
-  desc "Render PDFs in the terminal"
+  desc "View documents and images in the terminal"
   homepage "https://github.com/rasmus105/ptz"
-  license "MIT"
+  license "AGPL-3.0-or-later"
 
   on_macos do
     on_arm do
@@ -20,10 +20,8 @@ class Ptz < Formula
   end
 
   def install
-    # ptz finds PDFium in ../lib relative to itself; libexec keeps PDFium out
-    # of the shared Homebrew lib/ directory.
-    libexec.install "bin", "lib"
-    bin.install_symlink libexec/"bin/ptz"
+    bin.install "bin/ptz"
+    pkgshare.install Dir["share/ptz/*"]
   end
 
   test do

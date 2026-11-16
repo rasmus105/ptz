@@ -36,12 +36,24 @@ jobs:
       - name: Package
         run: |
           dir="ptz-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
-          cp LICENSE README.md "$dir/"
-          tar czf "$dir.tar.gz" "$dir"
+          cp LICENSE NOTICE README.md "$dir/"
+          COPYFILE_DISABLE=1 tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
           path: ptz-*.tar.gz
+      - name: Package corresponding source
+        if: matrix.target == 'aarch64-macos'
+        run: |
+          zig build source --prefix sources
+          version=${GITHUB_REF_NAME#v}
+          git archive --format=tar.gz --prefix="ptz-$version-source/" \
+            --output="sources/ptz-$version-source.tar.gz" HEAD
+      - uses: actions/upload-artifact@v4
+        if: matrix.target == 'aarch64-macos'
+        with:
+          name: source
+          path: sources/*.tar.gz
 
   publish:
     needs: build
@@ -54,7 +66,7 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" ptz-*.tar.gz --generate-notes ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
+        run: gh release create "$GITHUB_REF_NAME" ptz-*.tar.gz mupdf-*-source.tar.gz --generate-notes ${{ contains(github.ref_name, '-') && '--prerelease' || '' }}
       - name: Update Homebrew tap
         if: ${{ !contains(github.ref_name, '-') }}
         env:

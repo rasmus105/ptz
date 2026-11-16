@@ -28,6 +28,8 @@ pub const wanted_bytes_max = 32 * tile_bytes_max;
 /// Pages are never rendered wider, which keeps pixel offsets far from
 /// overflowing and rendering cost per page bounded.
 pub const page_width_max = 16384;
+/// Keep very tall pages within the integer coordinate range of renderers.
+pub const page_height_max = 1 << 24;
 /// Space between pages, in pixels.
 pub const gap = 12;
 
@@ -143,7 +145,11 @@ pub const Geometry = struct {
         std.debug.assert(size.cols > 0 and size.cell_width > 0 and size.cell_height > 0);
         const view_width = @as(u32, size.cols) * size.cell_width;
         var widest: f32 = 0;
-        for (page_sizes) |page| widest = @max(widest, page.width);
+        var tallest: f32 = 0;
+        for (page_sizes) |page| {
+            widest = @max(widest, page.width);
+            tallest = @max(tallest, page.height);
+        }
         var geometry: Geometry = .{
             .page_sizes = page_sizes,
             .page_offsets = page_offsets,
@@ -152,6 +158,7 @@ pub const Geometry = struct {
             .scale = if (widest == 0) 1 else @min(
                 @as(f32, @floatFromInt(view_width)) / widest * zoom,
                 page_width_max / widest,
+                page_height_max / tallest,
             ),
             .content_width = 0,
             .content_height = 0,
@@ -426,4 +433,18 @@ test "the wanted tiles stay within the memory bound" {
     var bytes: u64 = 0;
     for (tiles.wanted()) |tile| bytes += @as(u64, tile.width()) * tile.height() * 4;
     try std.testing.expect(bytes <= wanted_bytes_max);
+}
+
+test "extremely tall pages keep render coordinates bounded at maximum zoom" {
+    const pages = [_]document.Size{.{ .width = 1, .height = 100_000 }};
+    const offsets = testOffsets(&pages);
+    const geometry: Geometry = .init(&pages, &offsets, test_size, 1000);
+    var tiles: Tiles = undefined;
+    layout(geometry, geometry.anchorAt(geometry.content_height), 0, test_version, &tiles);
+    try std.testing.expect(tiles.slices_len > 0);
+    try std.testing.expect(geometry.pageHeight(0) <= page_height_max);
+    for (tiles.wanted()) |tile| {
+        try std.testing.expect(tile.top() + tile.height() <= page_height_max);
+        try std.testing.expect(tile.width() > 0 and tile.height() > 0);
+    }
 }

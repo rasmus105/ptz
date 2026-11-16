@@ -27,6 +27,18 @@ const shm = @import("shm.zig");
 /// used elsewhere.
 pub const ImageId = u32;
 
+/// An image response from the terminal. Placements identify themselves so a
+/// missing cached image can be distinguished from an unreadable upload.
+pub const Reply = struct {
+    image: ImageId,
+    placement: ?u32,
+    status: enum { ok, not_found, rejected },
+
+    pub fn parse(bytes: []const u8) ?Reply {
+        return kitty.parseReply(bytes);
+    }
+};
+
 /// How image data reaches the terminal.
 pub const Medium = enum {
     /// Compressed and base64-encoded inside the escape sequences. Works
@@ -125,6 +137,7 @@ pub const Encoded = struct {
 /// A successful write or flush only queues bytes; the terminal may not have
 /// opened the object yet, so callers retain this across image eviction.
 pub const Transfer = struct {
+    image: ImageId,
     name: shm.Name,
     bytes: u64,
 
@@ -176,7 +189,7 @@ pub fn transmit(gpa: std.mem.Allocator, writer: *std.Io.Writer, id: ImageId, enc
     try kitty.transmit(writer, id, encoded);
     return switch (encoded.data) {
         .direct => null,
-        .shared_memory => |name| .{ .name = name, .bytes = @as(u64, encoded.width) * encoded.height * 4 },
+        .shared_memory => |name| .{ .image = id, .name = name, .bytes = @as(u64, encoded.width) * encoded.height * 4 },
     };
 }
 

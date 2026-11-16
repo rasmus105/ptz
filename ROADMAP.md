@@ -21,9 +21,11 @@
 
 ## v0.3.0 - Extended support
 
+- [x] Replace PDFium and stb_image with MuPDF; license under AGPL-3.0-or-later
 - [x] Support raster image formats
-- [ ] More document formats (epub, xps, cbz)
-- [ ] SVG
+- [x] More document formats (EPUB, XPS, CBZ/CBT, FB2, MOBI)
+- [x] SVG (MuPDF's supported subset)
+- [x] Multipage images
 
 ## vX.Y.Z
 

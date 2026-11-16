@@ -27,15 +27,15 @@ const posix = std.posix;
 // Constants
 // ====================================================================================================
 
-/// Bytes uploaded per frame. Uploads beyond it wait for the next loop
-/// iteration, so keys are handled between large uploads.
+/// Bounds both transmitted bytes and decoded image work per frame, including
+/// shared memory. Larger batches wait so keys are handled between uploads.
 const upload_bytes_per_frame = 8 * 1024 * 1024;
 /// How often to check the file for changes when watching.
 const watch_interval_ms = 250;
 /// Distinguishes Escape from an escape sequence split across reads.
 const escape_timeout_ms = 50;
 /// The longest key sequence kept while waiting for the rest of it.
-const pending_input_max = 32;
+const pending_input_max = 128;
 /// The most bytes `App.input` takes at once.
 pub const input_len_max = 256;
 
@@ -65,6 +65,10 @@ pub const App = struct {
     /// The start of a key sequence cut off at the end of the last input.
     pending_input: [pending_input_max]u8,
     pending_input_len: u32,
+    /// Once a control string exceeds the buffer, discard through its terminator
+    /// rather than interpreting the remaining protocol bytes as user commands.
+    discarding_string: bool,
+    discarded_escape: bool,
     escape_started: ?std.Io.Timestamp,
     /// Whether the screen is out of date.
     dirty: bool,
@@ -93,6 +97,8 @@ pub const App = struct {
             .results = .empty,
             .pending_input = undefined,
             .pending_input_len = 0,
+            .discarding_string = false,
+            .discarded_escape = false,
             .escape_started = null,
             .dirty = true,
             .resized = false,
@@ -117,10 +123,25 @@ pub const App = struct {
     pub fn input(app: *App, bytes: []const u8) bool {
         std.debug.assert(bytes.len <= input_len_max);
         if (bytes.len == 0) return false;
+        var incoming = bytes;
+        if (app.discarding_string) {
+            while (incoming.len > 0) {
+                const byte = incoming[0];
+                incoming = incoming[1..];
+                const finished = byte == 0x07 or (app.discarded_escape and byte == '\\');
+                app.discarded_escape = byte == 0x1b;
+                if (finished) {
+                    app.discarding_string = false;
+                    app.discarded_escape = false;
+                    break;
+                }
+            }
+            if (app.discarding_string or incoming.len == 0) return false;
+        }
         var buffer: [pending_input_max + input_len_max]u8 = undefined;
         @memcpy(buffer[0..app.pending_input_len], app.pending_input[0..app.pending_input_len]);
-        @memcpy(buffer[app.pending_input_len..][0..bytes.len], bytes);
-        var unread = buffer[0 .. app.pending_input_len + bytes.len];
+        @memcpy(buffer[app.pending_input_len..][0..incoming.len], incoming);
+        var unread = buffer[0 .. app.pending_input_len + incoming.len];
         app.pending_input_len = 0;
         app.escape_started = null;
 
@@ -131,9 +152,30 @@ pub const App = struct {
                     @memcpy(app.pending_input[0..unread.len], unread);
                     app.pending_input_len = @intCast(unread.len);
                     if (std.mem.eql(u8, unread, "\x1b")) app.escape_started = .now(app.renderer.io, .awake);
+                } else if (std.mem.startsWith(u8, unread, "\x1b_") or
+                    std.mem.startsWith(u8, unread, "\x1b]") or
+                    std.mem.startsWith(u8, unread, "\x1bP"))
+                {
+                    app.discarding_string = true;
+                    app.discarded_escape = unread[unread.len - 1] == 0x1b;
                 }
                 return false;
             };
+            if (graphics.Reply.parse(unread[0..decoded.len])) |reply| {
+                switch (app.cache.reject(reply)) {
+                    .ignored => {},
+                    .retry => app.dirty = true,
+                    .failed => {
+                        _ = app.state.update(.{ .message = if (reply.status == .not_found and reply.placement == 1)
+                            "terminal cannot retain visible images"
+                        else
+                            "terminal rejected image" });
+                        app.dirty = true;
+                    },
+                }
+                unread = unread[decoded.len..];
+                continue;
+            }
             unread = unread[decoded.len..];
             app.dirty = true;
             switch (app.state.update(.{ .key = decoded.key })) {
@@ -183,9 +225,14 @@ pub const App = struct {
         const frame = &app.frame;
         app.state.layout(frame);
 
+        var visible_tiles: [viewer.tiles_max]viewer.Tile = undefined;
+        const visible = visible_tiles[0..frame.slices().len];
+        for (visible, frame.slices()) |*tile, slice| tile.* = slice.tile;
+        app.cache.beginFrame(visible);
+
         var missing: [viewer.tiles_max]viewer.Tile = undefined;
         app.renderer.want(app.cache.findMissing(frame.wanted(), &missing));
-        app.dirty = try app.cache.upload(app.gpa, output, frame.wanted(), upload_bytes_per_frame);
+        app.dirty = try app.cache.upload(app.gpa, output, visible, upload_bytes_per_frame);
 
         try output.writeAll(terminal.sync_begin);
         if (app.resized) try output.writeAll(terminal.clear_text);
@@ -414,6 +461,7 @@ const Emulator = @import("../emulator/main.zig").Emulator;
 test {
     _ = Cache;
     _ = Renderer;
+    _ = @import("recovery_test.zig");
 }
 
 test "a change reloads once it has held for a check, and only once" {

@@ -8,8 +8,7 @@ Terminal PDF and image viewer written in Zig 0.17.
   frames (which tile slices go where, which tiles to render) out.
 - `app/`: the I/O shell: event loop, render thread (`Renderer`), the tiles
   uploaded to the terminal (`Cache`).
-- `document/`, `graphics/`, `terminal/`: engine-neutral wrappers around PDFium
-  and stb_image, the kitty graphics protocol and the terminal.
+- `document/`, `graphics/`, `terminal/`: engine-neutral wrappers around MuPDF, the kitty graphics protocol and the terminal.
 
 ## Code style
 
@@ -85,6 +84,8 @@ empty ones:
   Add `--fuzz 300 --seed N` to press random keys and resizes instead,
   checking the screen against a fresh viewer's; failures are reproducible
   from the seed.
+  Add `--threaded --image-limit-mb 64` to exercise the real worker and a smaller
+  terminal image cache, with coverage and latency checks.
 - For behaviour that needs a real terminal (raw mode, resizing, detection in
   an actual emulator), run ptz in a background Rex tab and read it with
   `rex capture`; Rex captures text only.

@@ -1,0 +1,47 @@
+MuPDF 1.28.6: preserve the scale and position of embedded SVG crops.
+
+Scalable images must rasterize at the requested device resolution and map
+cropped pixels back to that same coordinate system. Otherwise EPUB covers
+stretch a different source region into each tile. Widen crop products so
+high zoom does not overflow before the bounded pixmap is allocated.
+
+--- a/source/fitz/image.c
++++ b/source/fitz/image.c
+@@ -1047,12 +1047,19 @@
+ 	{
+ 		/* If the image is scalable, we always want to re-render and never cache. */
+ 		fz_irect subarea_copy;
++		fz_irect bbox;
+ 		if (subarea)
+ 			subarea_copy = *subarea;
+ 		l2factor_remaining = 0;
+-		if (dw) *dw = w;
+-		if (dh) *dh = h;
+-		return image->get_pixmap(ctx, image, subarea ? &subarea_copy : NULL, image->w, image->h, &l2factor_remaining);
++		if (w < 1) w = 1;
++		if (h < 1) h = 1;
++		/* ptz (2026-11-16): scalable crops retain their device-space position. */
++		tile = image->get_pixmap(ctx, image, subarea ? &subarea_copy : NULL, w, h, &l2factor_remaining);
++		bbox = fz_pixmap_bbox(ctx, tile);
++		if (dw) *dw = bbox.x1 - bbox.x0;
++		if (dh) *dh = bbox.y1 - bbox.y0;
++		update_ctm_for_subarea(ctm, &bbox, w, h);
++		return tile;
+ 	}
+ 
+ 	/* Clamp requested image size, since we never want to magnify images here. */
+@@ -1745,10 +1752,10 @@
+ 	{
+ 		/* So, the whole image should be scaled to w * h, but we only want the
+ 		 * given subarea of it. */
+-		int l = (subarea->x0 * w) / image->super.w;
+-		int t = (subarea->y0 * h) / image->super.h;
+-		int r = (subarea->x1 * w + image->super.w - 1) / image->super.w;
+-		int b = (subarea->y1 * h + image->super.h - 1) / image->super.h;
++		int l = ((int64_t)subarea->x0 * w) / image->super.w;
++		int t = ((int64_t)subarea->y0 * h) / image->super.h;
++		int r = ((int64_t)subarea->x1 * w + image->super.w - 1) / image->super.w;
++		int b = ((int64_t)subarea->y1 * h + image->super.h - 1) / image->super.h;
+ 
+ 		pix = fz_new_pixmap(ctx, image->super.colorspace, r-l, b-t, NULL, 0);
+ 		pix->x = l;

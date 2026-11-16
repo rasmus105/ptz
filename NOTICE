@@ -1,0 +1,22 @@
+ptz
+Copyright (c) 2026 Rasmus Kargo
+Licensed under the GNU Affero General Public License, version 3 or later.
+
+This software uses MuPDF, copyright (c) 2006-2026 Artifex Software, Inc.,
+under the GNU Affero General Public License, version 3 or later.
+MuPDF and its bundled dependencies retain their own copyright notices and
+licenses, installed under share/ptz/licenses/mupdf in binary distributions.
+The bundled MuPDF includes ptz's 2026-11-16 corrections to single-column
+image resampling, JPEG metadata diagnostics, and embedded SVG crop placement.
+The distributed MuPDF source includes all three corrections.
+
+This software is based in part on the work of the Independent JPEG Group.
+Portions of this software are copyright (c) 2026 The FreeType Project
+(www.freetype.org). All rights reserved.
+
+Source for ptz and its MuPDF build (including bundled dependencies and the
+local corrections) is provided alongside the binaries in each GitHub release:
+https://github.com/rasmus105/ptz/releases
+
+MuPDF base source: https://github.com/ArtifexSoftware/mupdf-downloads/releases/tag/1.28.6
+Development sources and build instructions: https://github.com/rasmus105/ptz

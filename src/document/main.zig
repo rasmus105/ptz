@@ -1,16 +1,13 @@
-//! Opens PDF and raster documents as pages rendered into RGBA tiles.
-//! Backends stay private so the viewer uses the same geometry and navigation
-//! for every format. A document owns a file snapshot, unaffected by rewrites.
-//!
-//! Documents can be used from any thread. PDFium calls are serialized; decoded
-//! images are immutable and may be rendered concurrently.
+//! Opens documents and images as pages rendered into RGBA tiles.
+//! The viewer uses the same geometry and navigation for every format. A
+//! document owns a file snapshot, unaffected by rewrites. Engine calls are
+//! serialized, so documents may be used from any thread.
 
 // std
 const std = @import("std");
 
 // local
-const pdf = @import("pdf.zig");
-const image = @import("image.zig");
+const mupdf = @import("mupdf.zig");
 
 // ====================================================================================================
 // Constants
@@ -19,8 +16,8 @@ const image = @import("image.zig");
 /// Larger files are refused rather than read into memory.
 const file_size_max = 1024 * 1024 * 1024;
 
-/// Page sizes stay within this range of points: PDF sizes are clamped and
-/// oversized rasters are refused. Callers never compute with zero, negative,
+/// Page sizes stay within this range of points. Oversized rasters are
+/// refused. Callers never compute with zero, negative,
 /// huge or NaN sizes. 100000 pt is about 35 m.
 pub const page_size_min = 1;
 pub const page_size_max = 100_000;
@@ -68,7 +65,7 @@ pub const View = struct {
 pub const Document = struct {
     gpa: std.mem.Allocator,
     bytes: []const u8,
-    backend: union(enum) { pdf: pdf.Document, image: image.Image },
+    backend: mupdf.Document,
 
     pub fn open(io: std.Io, gpa: std.mem.Allocator, path: []const u8) Error!Document {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_size_max)) catch |err| return switch (err) {
@@ -81,46 +78,22 @@ pub const Document = struct {
         };
         errdefer gpa.free(bytes);
 
-        // Preserve PDFium's format and password errors. Trying it first also
-        // accepts PDFs with leading bytes before their header.
-        const backend: @FieldType(Document, "backend") = if (pdf.Document.open(io, bytes)) |doc|
-            .{ .pdf = doc }
-        else |err| switch (err) {
-            error.InvalidFormat => .{ .image = try image.Image.open(gpa, bytes) },
-            else => return err,
-        };
-        // Only PDFium borrows the file snapshot after opening.
-        const retained = switch (backend) {
-            .pdf => bytes,
-            .image => blk: {
-                gpa.free(bytes);
-                break :blk &.{};
-            },
-        };
-        return .{ .gpa = gpa, .bytes = retained, .backend = backend };
+        const backend = try mupdf.Document.open(io, bytes);
+        return .{ .gpa = gpa, .bytes = bytes, .backend = backend };
     }
 
     pub fn close(doc: *Document) void {
-        switch (doc.backend) {
-            .pdf => |*backend| backend.close(),
-            .image => |*backend| backend.close(),
-        }
+        doc.backend.close();
         doc.gpa.free(doc.bytes);
         doc.* = undefined;
     }
 
     pub fn pageCount(doc: *const Document) u32 {
-        return switch (doc.backend) {
-            .pdf => |*backend| backend.pageCount(),
-            .image => 1,
-        };
+        return doc.backend.pageCount();
     }
 
     pub fn pageSize(doc: *const Document, page: u32) Error!Size {
-        return switch (doc.backend) {
-            .pdf => |*backend| backend.pageSize(page),
-            .image => |*backend| if (page == 0) backend.size() else error.PageNotFound,
-        };
+        return doc.backend.pageSize(page);
     }
 
     /// Renders the selected region on white; pixels outside the page stay white.
@@ -128,13 +101,7 @@ pub const Document = struct {
         std.debug.assert(view.page_width > 0);
         std.debug.assert(view.page_height > 0);
         std.debug.assert(target.pixels.len == @as(usize, target.width) * target.height * 4);
-        switch (doc.backend) {
-            .pdf => |*backend| try backend.render(page, view, target),
-            .image => |*backend| {
-                if (page != 0) return error.PageNotFound;
-                backend.render(view, target);
-            },
-        }
+        try doc.backend.render(page, view, target);
     }
 };
 
@@ -221,7 +188,7 @@ test "images decode by content, composite alpha on white, and validate page indi
     var doc = try Document.open(io, gpa, path);
     defer doc.close();
     try std.testing.expectEqual(1, doc.pageCount());
-    try std.testing.expectEqual(Size{ .width = 2, .height = 2 }, try doc.pageSize(0));
+    try std.testing.expectEqual(Size{ .width = 1.5, .height = 1.5 }, try doc.pageSize(0));
     try std.testing.expectError(error.PageNotFound, doc.pageSize(1));
     const bitmap = try testBitmap(gpa, 2, 2);
     defer gpa.free(bitmap.pixels);
@@ -234,7 +201,11 @@ test "images decode by content, composite alpha on white, and validate page indi
     const scaled = try testBitmap(gpa, 4, 4);
     defer gpa.free(scaled.pixels);
     try doc.render(0, .{ .page_width = 4, .page_height = 4, .x = 0, .y = 0 }, scaled);
-    try std.testing.expectEqual([4]u8{ 255, 64, 64, 255 }, pixel(scaled, 1, 0));
+    const blended = pixel(scaled, 1, 0);
+    try std.testing.expectEqual(@as(u8, 255), blended[0]);
+    try std.testing.expect(blended[1] > 0 and blended[1] < 255);
+    try std.testing.expectEqual(blended[1], blended[2]);
+    try std.testing.expectEqual(@as(u8, 255), blended[3]);
 }
 
 test "image tiles match a whole render at fractional scales and outside the page" {
@@ -255,20 +226,23 @@ test "image tiles match a whole render at fractional scales and outside the page
     try std.testing.expect(std.mem.allEqual(u8, tile.pixels, 255));
 }
 
-test "common raster decoders render known colours including the first GIF frame" {
+test "common raster decoders render known colours and GIFs as a static image" {
     const gpa = std.testing.allocator;
     const bitmap = try testBitmap(gpa, 2, 2);
     defer gpa.free(bitmap.pixels);
-    for ([_][]const u8{ "colors.bmp", "colors.tga", "animated.gif" }) |name| {
-        const path = try std.fmt.allocPrint(gpa, "src/document/testdata/{s}", .{name});
-        defer gpa.free(path);
-        var doc = try Document.open(std.testing.io, gpa, path);
-        defer doc.close();
-        try doc.render(0, .{ .page_width = 2, .page_height = 2, .x = 0, .y = 0 }, bitmap);
-        try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixel(bitmap, 0, 0));
-        try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, pixel(bitmap, 1, 0));
-        try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pixel(bitmap, 1, 1));
-    }
+    var bmp = try Document.open(std.testing.io, gpa, "src/document/testdata/colors.bmp");
+    defer bmp.close();
+    try bmp.render(0, .{ .page_width = 2, .page_height = 2, .x = 0, .y = 0 }, bitmap);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixel(bitmap, 0, 0));
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, pixel(bitmap, 1, 0));
+    try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, pixel(bitmap, 1, 1));
+    var gif = try Document.open(std.testing.io, gpa, "src/document/testdata/animated.gif");
+    defer gif.close();
+    try std.testing.expectEqual(@as(u32, 1), gif.pageCount());
+    try gif.render(0, .{ .page_width = 2, .page_height = 2, .x = 0, .y = 0 }, bitmap);
+    // The second GIF frame paints the canvas green; MuPDF composites it into
+    // the static document rather than exposing animation frames as pages.
+    try std.testing.expectEqualSlices(u8, &.{ 0, 128, 0, 255, 0, 128, 0, 255, 0, 128, 0, 255, 0, 128, 0, 255 }, bitmap.pixels);
     var jpeg = try Document.open(std.testing.io, gpa, "src/document/testdata/red-square.jpg");
     defer jpeg.close();
     try jpeg.render(0, .{ .page_width = 200, .page_height = 100, .x = 30, .y = 50 }, bitmap);
@@ -291,6 +265,39 @@ test "narrow images preserve their proportions and oversized images fail before 
     defer gpa.free(bitmap.pixels);
     try doc.render(0, .{ .page_width = 1, .page_height = 3, .x = 0, .y = 0 }, bitmap);
     try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255 }, bitmap.pixels);
-    try std.testing.expectError(error.FileTooBig, Document.open(std.testing.io, gpa, "src/document/testdata/too-wide.ppm"));
-    try std.testing.expectError(error.FileTooBig, Document.open(std.testing.io, gpa, "src/document/testdata/too-many-pixels.ppm"));
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const header = "P6\n100001 1\n255\n";
+    const bytes = try gpa.alloc(u8, header.len + 100001 * 3);
+    defer gpa.free(bytes);
+    @memcpy(bytes[0..header.len], header);
+    @memset(bytes[header.len..], 0);
+    try tmp.dir.writeFile(io, .{ .sub_path = "wide.ppm", .data = bytes });
+    const path = try tmp.dir.realPathFileAlloc(io, "wide.ppm", gpa);
+    defer gpa.free(path);
+    try std.testing.expectError(error.FileTooBig, Document.open(io, gpa, path));
+
+    // These declare oversized dimensions but contain no pixel data.
+    try std.testing.expectError(error.InvalidFormat, Document.open(io, gpa, "src/document/testdata/too-wide.ppm"));
+    try std.testing.expectError(error.InvalidFormat, Document.open(io, gpa, "src/document/testdata/too-many-pixels.ppm"));
+}
+
+test {
+    _ = @import("test.zig");
+}
+
+test "unrepresentable render sizes fail without invalidating the document" {
+    var doc = try Document.open(std.testing.io, std.testing.allocator, "src/document/testdata/ordered.cbz");
+    defer doc.close();
+    var pixels: [4]u8 = undefined;
+    const target: Bitmap = .{ .width = 1, .height = 1, .pixels = &pixels };
+    try std.testing.expectError(error.FileTooBig, doc.render(0, .{
+        .page_width = std.math.maxInt(u32),
+        .page_height = std.math.maxInt(u32),
+        .x = 0,
+        .y = 0,
+    }, target));
+    try doc.render(0, .{ .page_width = 1, .page_height = 1, .x = 0, .y = 0 }, target);
+    try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixels);
 }

@@ -9,6 +9,10 @@
 //! screen along the way: every visible part of a page must be covered by an
 //! image, and the screen must match a fresh viewer's in the same state. The
 //! run is reproducible from `--seed`.
+//!
+//! `--threaded` instead uses the real render thread and wake pipe, pacing
+//! input with `--key-delay-ms` and reporting incomplete frames and their
+//! duration. `--timeout-ms` bounds the initial and final wait for rendering.
 
 // std
 const std = @import("std");
@@ -21,12 +25,15 @@ const terminal = @import("terminal/main.zig");
 // local
 const argparse = @import("argparse.zig");
 
+// aliases
+const posix = std.posix;
+
 // ====================================================================================================
 // Constants
 // ====================================================================================================
 
-/// Ghostty logs every image placement at debug level, and commands it
-/// rejects as warnings, which `--fuzz` counts as failures.
+/// Ghostty logs rejected commands as warnings. Missing images may recover
+/// through replies; other rejections fail screen validation.
 pub const std_options: std.Options = .{ .log_level = .warn, .logFn = log };
 
 /// Key names usable in `--keys`, as `<Name>`.
@@ -49,13 +56,14 @@ const fuzz_keys = [_][]const u8{
 /// Checks the screen after this many events, and at the end.
 const fuzz_check_interval = 16;
 /// How far a pixel may be from a fresh viewer's, per channel, and how many
-/// may be further: PDFium's resampling of embedded images varies slightly
-/// with what it rendered before.
+/// may be further. Raster resampling can vary slightly with tile boundaries
+/// and the resolution of decoded images already in the engine cache.
 const fuzz_tolerance = 32;
 const fuzz_outliers_max = 16;
 
-/// Warnings Ghostty logged about image commands since the last fuzz check.
+/// Unexpected image command warnings; missing uploads may recover through replies.
 var terminal_warnings: u32 = 0;
+var terminal_missing_images: u32 = 0;
 
 // ====================================================================================================
 // Types
@@ -74,8 +82,12 @@ const Options = struct {
     fuzz: u32 = 0,
     seed: u64 = 0,
     direct: bool = false,
+    image_limit_mb: u32 = 320,
+    threaded: bool = false,
+    key_delay_ms: u32 = 16,
+    timeout_ms: u32 = 5000,
 
-    pub const positional = .{ .file = "PDF or image file to open" };
+    pub const positional = .{ .file = "Document or image file to open" };
     pub const shorts = .{ .page = 'p', .keys = 'k', .out = 'o' };
     pub const help = .{
         .page = "Page to open at",
@@ -89,6 +101,10 @@ const Options = struct {
         .fuzz = "Press this many random keys and resizes, checking the screen",
         .seed = "Seed for --fuzz",
         .direct = "Send images inline instead of in shared memory",
+        .image_limit_mb = "Emulated terminal's image storage limit in decimal MB",
+        .threaded = "Use the real render thread and measure incomplete frames",
+        .key_delay_ms = "Delay between events with --threaded",
+        .timeout_ms = "Maximum wait for initial and final rendering with --threaded",
     };
 };
 
@@ -106,6 +122,9 @@ pub fn main(init: std.process.Init) !void {
     const io = init.io;
     const gpa = init.gpa;
     const options = try Cli.parse(init);
+    defer if (terminal_missing_images > 0) {
+        std.debug.print("terminal reported {d} missing image commands\n", .{terminal_missing_images});
+    };
 
     const size: terminal.Size = .{
         .cols = options.cols,
@@ -120,28 +139,45 @@ pub fn main(init: std.process.Init) !void {
         .watch = false,
         .medium = if (options.direct) .direct else .shared_memory,
     };
-    if (options.fuzz > 0) return fuzz(io, gpa, app_options, size, options);
+    if (options.fuzz > 0 and !options.threaded) return fuzz(io, gpa, app_options, size, options);
+
+    var wake_fds: [2]posix.fd_t = .{ -1, -1 };
+    defer for (wake_fds) |fd| {
+        if (fd >= 0) _ = std.c.close(fd);
+    };
+    if (options.threaded) {
+        if (std.c.pipe(&wake_fds) != 0) return error.Unexpected;
+        const flags: c_int = @bitCast(@as(u32, @bitCast(posix.O{ .NONBLOCK = true })));
+        if (std.c.fcntl(wake_fds[1], posix.F.SETFL, flags) != 0) return error.Unexpected;
+    }
 
     const emulator: *Emulator = try .create(io, gpa, size);
     defer emulator.destroy();
+    emulator.terminal.setKittyGraphicsSizeLimit(gpa, @as(usize, options.image_limit_mb) * 1000 * 1000);
     const viewer = try gpa.create(app.App);
     defer gpa.destroy(viewer);
-    viewer.init(io, gpa, app_options, size, null);
+    viewer.init(io, gpa, app_options, size, if (options.threaded) wake_fds[1] else null);
     defer viewer.deinit();
 
-    try viewer.settle(&emulator.output);
-    var keys = options.keys;
-    while (keys.len > 0 and viewer.open_error == null) {
-        var bytes_buffer: [8]u8 = undefined;
-        const bytes, const len = keyBytes(keys, &bytes_buffer) catch |err|
-            std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
-        keys = keys[len..];
-        if (viewer.input(bytes)) break;
-        // Each harness key is complete, including a standalone Escape.
-        if (viewer.escape_started) |started| viewer.expireInput(started.addDuration(.fromSeconds(1)));
-        try viewer.settle(&emulator.output);
+    if (options.threaded) {
+        try threaded(io, gpa, emulator, viewer, wake_fds[0], options);
+    } else {
+        try settle(io, viewer, emulator, options.timeout_ms);
+        var keys = options.keys;
+        while (keys.len > 0 and viewer.open_error == null) {
+            var bytes_buffer: [8]u8 = undefined;
+            const bytes, const len = keyBytes(keys, &bytes_buffer) catch |err|
+                std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
+            keys = keys[len..];
+            if (viewer.input(bytes)) break;
+            // Each harness key is complete, including a standalone Escape.
+            if (viewer.escape_started) |started| viewer.expireInput(started.addDuration(.fromSeconds(1)));
+            try settle(io, viewer, emulator, options.timeout_ms);
+        }
     }
     if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });
+
+    try fuzzCheck(io, gpa, emulator, viewer, app_options);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_writer: std.Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
@@ -168,8 +204,159 @@ fn log(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (scope == .kitty_gfx and level == .warn) terminal_warnings += 1;
+    if (scope == .kitty_gfx and level == .warn) {
+        const missing_image = comptime std.mem.eql(u8, format, "erroneous kitty graphics response: {s}");
+        if (missing_image and std.mem.startsWith(u8, args[0], "ENOENT:")) {
+            terminal_missing_images += 1;
+            return;
+        }
+        terminal_warnings += 1;
+    }
     std.log.defaultLog(level, scope, format, args);
+}
+
+/// A flush only queues image commands. Deliver terminal replies before
+/// deciding that rendering is complete, so missing uploads can be retried.
+fn settle(io: std.Io, viewer: *app.App, emulator: *Emulator, timeout_ms: u32) !void {
+    const started: std.Io.Timestamp = .now(io, .awake);
+    while (true) {
+        try viewer.settle(&emulator.output);
+        var buffer: [app.input_len_max]u8 = undefined;
+        while (true) {
+            const len = try emulator.input.readSliceShort(&buffer);
+            if (len == 0) break;
+            std.debug.assert(!viewer.input(buffer[0..len]));
+        }
+        if (!viewer.dirty) return;
+        if (started.durationTo(.now(io, .awake)).toMilliseconds() >= timeout_ms) return error.RenderTimeout;
+    }
+}
+
+/// Keeps the production render thread and wake pipe, and observes frames
+/// before rendering catches up instead of making each input wait for it.
+fn threaded(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *app.App, wake_fd: posix.fd_t, options: Options) !void {
+    try viewer.renderer.start();
+    var prng: std.Random.DefaultPrng = .init(options.seed);
+    const random = prng.random();
+    var events: std.Io.Writer.Allocating = .init(gpa);
+    defer events.deinit();
+    errdefer std.debug.print("events: {s}\n", .{events.written()});
+    var keys = options.keys;
+    var event_index: u32 = 0;
+    var ready = false;
+    var last_event: std.Io.Timestamp = .now(io, .awake);
+    const started = last_event;
+    var uncovered_started: ?std.Io.Timestamp = null;
+    var uncovered_max_ms: i64 = 0;
+    var draw_max_ms: i64 = 0;
+    var uncovered_frames: u32 = 0;
+    var frames: u32 = 0;
+    var uncovered: u64 = 0;
+    var first_covered = false;
+    var final_covered = false;
+    defer {
+        if (uncovered_started) |since| uncovered_max_ms = @max(uncovered_max_ms, since.durationTo(.now(io, .awake)).toMilliseconds());
+        std.debug.print("threaded seed {d}: {d} events, {d}/{d} incomplete frames, longest uncovered {d} ms, slowest draw {d} ms\n", .{
+            options.seed, event_index, uncovered_frames, frames, uncovered_max_ms, draw_max_ms,
+        });
+    }
+
+    while (true) {
+        try viewer.collect();
+        if (viewer.open_error != null) return;
+        if (viewer.dirty) {
+            const draw_started: std.Io.Timestamp = .now(io, .awake);
+            try viewer.draw(&emulator.output);
+            const drawn: std.Io.Timestamp = .now(io, .awake);
+            draw_max_ms = @max(draw_max_ms, draw_started.durationTo(drawn).toMilliseconds());
+            const screen = try emulator.screenshot(gpa);
+            defer gpa.free(screen.pixels);
+            uncovered = uncoveredPixels(viewer, screen);
+            frames += 1;
+            if (uncovered > 0) {
+                uncovered_frames += 1;
+                if (uncovered_started == null) uncovered_started = draw_started;
+            } else if (uncovered_started) |since| {
+                uncovered_max_ms = @max(uncovered_max_ms, since.durationTo(drawn).toMilliseconds());
+                uncovered_started = null;
+            }
+            if (!first_covered and viewer.state.document.generation != 0 and uncovered == 0) {
+                first_covered = true;
+                std.debug.print("first covered viewport: {d} ms\n", .{started.durationTo(drawn).toMilliseconds()});
+            }
+        }
+        var replies_buffer: [app.input_len_max]u8 = undefined;
+        while (true) {
+            const len = try emulator.input.readSliceShort(&replies_buffer);
+            if (len == 0) break;
+            std.debug.assert(!viewer.input(replies_buffer[0..len]));
+        }
+
+        const now: std.Io.Timestamp = .now(io, .awake);
+        const idle = viewer.renderer.idle();
+        if (!ready and idle and !viewer.dirty and viewer.state.document.generation != 0) {
+            ready = true;
+            last_event = now;
+            std.debug.print("initial rendering including prefetch: {d} ms\n", .{started.durationTo(now).toMilliseconds()});
+        }
+        const more_events = if (options.fuzz > 0) event_index < options.fuzz else keys.len > 0;
+        if (ready and !more_events and event_index > 0 and !final_covered and uncovered == 0) {
+            final_covered = true;
+            std.debug.print("final covered viewport: {d} ms after last event\n", .{last_event.durationTo(now).toMilliseconds()});
+        }
+        if (ready and !more_events and idle and !viewer.dirty and uncovered == 0) return;
+        const elapsed = last_event.durationTo(now).toMilliseconds();
+        if ((!ready or !more_events) and elapsed >= options.timeout_ms) {
+            const screen = try emulator.screenshot(gpa);
+            defer gpa.free(screen.pixels);
+            try saveScreenshot(io, gpa, screen, options.out);
+            viewer.renderer.mutex.lockUncancelable(io);
+            std.debug.print("rendering timed out with {d} uncovered pixels, idle {any}, {d} queued tiles, rendering {any}, {d} results, {d} uploaded bytes, {d} pending bytes; screenshot: {s}\n", .{
+                uncovered,                   idle,                       viewer.renderer.wanted_len, viewer.renderer.rendering != null, viewer.renderer.results.items.len,
+                viewer.cache.uploaded_bytes, viewer.cache.pending_bytes, options.out,
+            });
+            viewer.renderer.mutex.unlock(io);
+            return error.RenderTimeout;
+        }
+
+        if (ready and more_events and elapsed >= options.key_delay_ms) {
+            if (options.fuzz > 0 and random.uintLessThan(u32, 40) == 0) {
+                const size: terminal.Size = .{
+                    .cols = random.intRangeAtMost(u16, 20, 250),
+                    .rows = random.intRangeAtMost(u16, 5, 70),
+                    .cell_width = random.intRangeAtMost(u16, 6, 20),
+                    .cell_height = random.intRangeAtMost(u16, 12, 40),
+                };
+                try events.writer.print("<resize {d}x{d} {d}x{d}>", .{ size.cols, size.rows, size.cell_width, size.cell_height });
+                try emulator.resize(size);
+                viewer.resize(size);
+            } else {
+                const event = if (options.fuzz > 0) fuzz_keys[random.uintLessThan(usize, fuzz_keys.len)] else keys;
+                var rest = event;
+                while (rest.len > 0) {
+                    var bytes_buffer: [8]u8 = undefined;
+                    const bytes, const len = try keyBytes(rest, &bytes_buffer);
+                    try events.writer.writeAll(rest[0..len]);
+                    rest = rest[len..];
+                    if (viewer.input(bytes)) return;
+                    if (viewer.escape_started) |since| viewer.expireInput(since.addDuration(.fromSeconds(1)));
+                    if (options.fuzz == 0) break;
+                }
+                if (options.fuzz == 0) keys = rest;
+            }
+            event_index += 1;
+            last_event = .now(io, .awake);
+            continue;
+        }
+
+        var fds = [_]posix.pollfd{.{ .fd = wake_fd, .events = posix.POLL.IN, .revents = 0 }};
+        const until_next: i64 = if (ready and more_events) @as(i64, options.key_delay_ms) - elapsed else @as(i64, options.timeout_ms) - elapsed;
+        _ = try posix.poll(&fds, if (viewer.dirty) 0 else @intCast(std.math.clamp(until_next, 0, std.math.maxInt(i32))));
+        if (fds[0].revents != 0) {
+            var buffer: [256]u8 = undefined;
+            _ = try posix.read(wake_fd, &buffer);
+        }
+    }
 }
 
 fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size: terminal.Size, options: Options) !void {
@@ -181,11 +368,12 @@ fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size
 
     const emulator: *Emulator = try .create(io, gpa, start_size);
     defer emulator.destroy();
+    emulator.terminal.setKittyGraphicsSizeLimit(gpa, @as(usize, options.image_limit_mb) * 1000 * 1000);
     const viewer = try gpa.create(app.App);
     defer gpa.destroy(viewer);
     viewer.init(io, gpa, app_options, start_size, null);
     defer viewer.deinit();
-    try viewer.settle(&emulator.output);
+    try settle(io, viewer, emulator, options.timeout_ms);
     if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });
 
     for (0..options.fuzz) |event_index| {
@@ -217,10 +405,16 @@ fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size
             if (random.boolean()) try viewer.draw(&emulator.output);
         }
         if (viewer.dirty) try viewer.draw(&emulator.output);
+        var replies_buffer: [app.input_len_max]u8 = undefined;
+        while (true) {
+            const len = try emulator.input.readSliceShort(&replies_buffer);
+            if (len == 0) break;
+            std.debug.assert(!viewer.input(replies_buffer[0..len]));
+        }
 
         const check = (event_index + 1) % fuzz_check_interval == 0 or event_index + 1 == options.fuzz;
         if (terminal_warnings > 0 or check) {
-            try viewer.settle(&emulator.output);
+            try settle(io, viewer, emulator, options.timeout_ms);
             fuzzCheck(io, gpa, emulator, viewer, app_options) catch |err| {
                 const state = viewer.state;
                 std.debug.print("seed {d}, event {d}: {t}\n{d}x{d} cells of {d}x{d} px, page {d} + {d} pt, zoom {d}, pan {d}, {d} slices, {d} wanted\nevents: {s}\n", .{
@@ -242,34 +436,13 @@ fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size
 /// state, which has no history to get wrong. Writes both screenshots to
 /// zig-out on failure.
 fn fuzzCheck(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *app.App, app_options: app.Options) !void {
-    if (terminal_warnings > 0) return error.TerminalRejectedCommands;
     const screen = try emulator.screenshot(gpa);
     defer gpa.free(screen.pixels);
     errdefer saveScreenshot(io, gpa, screen, "zig-out/fuzz-actual.png") catch {};
+    if (terminal_warnings > 0) return error.TerminalRejectedCommands;
 
-    // Where pages are, worked out from the geometry rather than the tiles.
     const state = &viewer.state;
-    const geometry = state.geometry;
-    var uncovered: u64 = 0;
-    if (geometry.page_sizes.len > 0) {
-        const view_top = geometry.offsetOf(state.anchor);
-        const content_left: i64 = if (geometry.content_width <= geometry.view_width)
-            @divFloor(@as(i64, geometry.view_width) - geometry.content_width, 2)
-        else
-            -@as(i64, state.pan_x);
-        for (0..geometry.page_sizes.len) |index| {
-            const page: u32 = @intCast(index);
-            const top = geometry.pageTop(page) - view_top;
-            const left = content_left + @divFloor(@as(i64, geometry.content_width) - geometry.pageWidth(page), 2);
-            const y_end: u64 = @intCast(std.math.clamp(top + geometry.pageHeight(page), 0, geometry.view_height));
-            const x_end: u64 = @intCast(std.math.clamp(left + geometry.pageWidth(page), 0, geometry.view_width));
-            for (@intCast(std.math.clamp(top, 0, geometry.view_height))..y_end) |y| {
-                for (@intCast(std.math.clamp(left, 0, geometry.view_width))..x_end) |x| {
-                    if (screen.pixel(@intCast(x), @intCast(y))[3] == 0) uncovered += 1;
-                }
-            }
-        }
-    }
+    const uncovered = uncoveredPixels(viewer, screen);
     if (uncovered > 0) {
         std.debug.print("{d} page pixels not covered by any image\n", .{uncovered});
         return error.Uncovered;
@@ -281,13 +454,13 @@ fn fuzzCheck(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *a
     defer gpa.destroy(fresh);
     fresh.init(io, gpa, app_options, state.size, null);
     defer fresh.deinit();
-    try fresh.settle(&fresh_emulator.output);
+    try settle(io, fresh, fresh_emulator, 5000);
     const document = fresh.state.document;
     fresh.state = state.*;
     fresh.state.document = document;
     // Recomputes the geometry for the fresh document.
     fresh.resize(state.size);
-    try fresh.settle(&fresh_emulator.output);
+    try settle(io, fresh, fresh_emulator, 5000);
     const expected = try fresh_emulator.screenshot(gpa);
     defer gpa.free(expected.pixels);
 
@@ -323,6 +496,34 @@ fn fuzzCheck(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *a
         });
         return error.Differs;
     }
+}
+
+/// Counts missing page pixels independently of the tiles selected for rendering.
+fn uncoveredPixels(viewer: *const app.App, screen: Emulator.Screenshot) u64 {
+    // Where pages are, worked out from the geometry rather than the tiles.
+    const state = &viewer.state;
+    const geometry = state.geometry;
+    var uncovered: u64 = 0;
+    if (geometry.page_sizes.len > 0) {
+        const view_top = geometry.offsetOf(state.anchor);
+        const content_left: i64 = if (geometry.content_width <= geometry.view_width)
+            @divFloor(@as(i64, geometry.view_width) - geometry.content_width, 2)
+        else
+            -@as(i64, state.pan_x);
+        for (0..geometry.page_sizes.len) |index| {
+            const page: u32 = @intCast(index);
+            const top = geometry.pageTop(page) - view_top;
+            const left = content_left + @divFloor(@as(i64, geometry.content_width) - geometry.pageWidth(page), 2);
+            const y_end: u64 = @intCast(std.math.clamp(top + geometry.pageHeight(page), 0, geometry.view_height));
+            const x_end: u64 = @intCast(std.math.clamp(left + geometry.pageWidth(page), 0, geometry.view_width));
+            for (@intCast(std.math.clamp(top, 0, geometry.view_height))..y_end) |y| {
+                for (@intCast(std.math.clamp(left, 0, geometry.view_width))..x_end) |x| {
+                    if (screen.pixel(@intCast(x), @intCast(y))[3] == 0) uncovered += 1;
+                }
+            }
+        }
+    }
+    return uncovered;
 }
 
 /// Writes `screenshot` as a PNG, with uncovered pixels in a dark grey like

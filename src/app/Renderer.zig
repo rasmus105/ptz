@@ -56,6 +56,7 @@ mutex: std.Io.Mutex,
 condition: std.Io.Condition,
 // Guarded by `mutex`:
 reload_requested: bool,
+loading: bool,
 /// Tiles to render, most urgent first. Replaced as a whole by `want`.
 wanted: [viewer.tiles_max]Tile,
 wanted_len: u32,
@@ -92,6 +93,7 @@ pub fn init(
         .mutex = .init,
         .condition = .init,
         .reload_requested = true,
+        .loading = false,
         .wanted = undefined,
         .wanted_len = 0,
         .rendering = null,
@@ -162,6 +164,15 @@ pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) std.mem.All
     renderer.results.clearRetainingCapacity();
 }
 
+/// Whether all requested work has finished and its results were collected.
+/// Unlike an empty queue, this also accounts for an in-progress reload.
+pub fn idle(renderer: *Renderer) bool {
+    renderer.mutex.lockUncancelable(renderer.io);
+    defer renderer.mutex.unlock(renderer.io);
+    return !renderer.reload_requested and !renderer.loading and
+        renderer.wanted_len == 0 and renderer.rendering == null and renderer.results.items.len == 0;
+}
+
 /// Does one unit of work: a pending reload, else the most urgent tile.
 /// Returns false if there was nothing to do.
 pub fn step(renderer: *Renderer) bool {
@@ -174,6 +185,7 @@ pub fn step(renderer: *Renderer) bool {
     };
     const reload_requested = renderer.reload_requested;
     renderer.reload_requested = false;
+    renderer.loading = reload_requested;
     if (!reload_requested and renderer.wanted_len > 0) {
         renderer.rendering = renderer.wanted[0];
         std.mem.copyForwards(Tile, renderer.wanted[0 .. renderer.wanted_len - 1], renderer.wanted[1..renderer.wanted_len]);
@@ -191,6 +203,7 @@ pub fn step(renderer: *Renderer) bool {
 
     renderer.mutex.lockUncancelable(renderer.io);
     renderer.rendering = null;
+    renderer.loading = false;
     if (result) |r| renderer.results.appendAssumeCapacity(r);
     renderer.mutex.unlock(renderer.io);
     if (result != null) if (renderer.wake_fd) |fd| {
