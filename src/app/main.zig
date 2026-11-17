@@ -207,14 +207,11 @@ pub const App = struct {
     pub fn collect(app: *App) std.mem.Allocator.Error!void {
         try app.renderer.collect(&app.results);
         defer app.results.clearRetainingCapacity();
-        for (app.results.items, 0..) |result, index| {
+        for (app.results.items) |result| {
             app.dirty = true;
             app.take(result) catch {
-                // Out of memory: `take` freed this result; drop the rest,
-                // which only costs rendering them again.
-                for (app.results.items[index + 1 ..]) |unused| unused.deinit(app.gpa);
+                // Later results may describe a reload the viewer must observe.
                 _ = app.state.update(.{ .message = "out of memory" });
-                return;
             };
         }
     }
@@ -539,6 +536,37 @@ test "shows the document, and keys move through it" {
     try std.testing.expectEqual([4]u8{ 0, 255, 255, 255 }, dark.pixel(80, 120));
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, dark.pixel(300, 40));
     try std.testing.expect(app.input("q"));
+}
+
+test "a tile cache allocation failure preserves a reload in the same batch" {
+    var failing: std.testing.FailingAllocator = .init(std.testing.allocator, .{});
+    const gpa = failing.allocator();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(std.testing.io, gpa, .{
+        .path = "src/document/testdata/red-square.pdf",
+        .page = 1,
+        .dark = false,
+        .watch = false,
+        .medium = .direct,
+    }, .{ .cols = 40, .rows = 11, .cell_width = 10, .cell_height = 20 }, null);
+    defer app.deinit();
+    var output: std.Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+
+    try std.testing.expect(app.renderer.step());
+    try app.collect();
+    try app.draw(&output.writer);
+    try std.testing.expect(app.renderer.step());
+    app.renderer.reload();
+    try std.testing.expect(app.renderer.step());
+
+    // Collection can move both results, but caching the first tile will fail.
+    try app.results.ensureTotalCapacity(gpa, 2);
+    failing.fail_index = failing.alloc_index;
+    try app.collect();
+    try std.testing.expect(failing.has_induced_failure);
+    try std.testing.expectEqual(2, app.state.document.generation);
 }
 
 test "an empty file stays open and reloads when PDF content arrives" {
