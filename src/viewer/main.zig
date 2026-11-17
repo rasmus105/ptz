@@ -158,8 +158,11 @@ pub const State = struct {
                 return state.apply(action);
             },
             .resize => |size| {
+                const old_width = state.geometry.view_width;
                 state.size = size;
                 state.relayout();
+                if (state.geometry.view_width != old_width and state.document.page_sizes.len > 0)
+                    state.panToPage(state.centrePage(), .if_hidden);
             },
             .document => |doc| {
                 std.debug.assert(doc.page_offsets.len == doc.page_sizes.len);
@@ -214,7 +217,7 @@ pub const State = struct {
         if (state.document.page_sizes.len == 0) return;
         const page = state.centrePage();
         state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(state.anchor) + delta);
-        if (state.centrePage() != page) state.panToPage(state.centrePage());
+        if (state.centrePage() != page) state.panToPage(state.centrePage(), .always);
     }
 
     /// The page at the middle of the view, which the user is looking at.
@@ -227,16 +230,17 @@ pub const State = struct {
         if (pages == 0) return;
         const anchor: Anchor = .{ .page = @intCast(std.math.clamp(page, 0, @as(i64, @intCast(pages - 1)))), .y = 0 };
         state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(anchor));
-        state.panToPage(anchor.page);
+        state.panToPage(anchor.page, .always);
     }
 
     /// Keeps `page` in view horizontally: a narrower page than the last may
     /// lie entirely outside the current pan.
-    fn panToPage(state: *State, page: u32) void {
+    fn panToPage(state: *State, page: u32, when: enum { always, if_hidden }) void {
         const geometry = state.geometry;
         const width = geometry.pageWidth(page);
         // Content rounds to 0 px wide in a tiny view, where pages are 1 px.
         const left = (geometry.content_width -| width) / 2;
+        if (when == .if_hidden and left < state.pan_x + geometry.view_width and left + width > state.pan_x) return;
         state.pan_x = if (width <= geometry.view_width)
             @min((left + width / 2) -| geometry.view_width / 2, geometry.panMax())
         else
@@ -246,10 +250,15 @@ pub const State = struct {
     fn setZoom(state: *State, zoom: f32) void {
         const half_width = @as(f32, @floatFromInt(state.geometry.view_width)) / 2;
         // Relayout clamps pan to the new bounds, so save the old centre first.
+        const was_centred = state.geometry.panMax() == 0;
         const old_centre = @as(f32, @floatFromInt(state.pan_x)) + half_width;
         const old_scale = state.geometry.scale;
         state.zoom = std.math.clamp(zoom, zoom_min, zoom_max);
         state.relayout();
+        if (was_centred) {
+            state.pan_x = state.geometry.panMax() / 2;
+            return;
+        }
         const centre = old_centre * (state.geometry.scale / old_scale);
         const pan_max: f32 = @floatFromInt(state.geometry.panMax());
         state.pan_x = @intFromFloat(std.math.clamp(centre - half_width, 0, pan_max));
@@ -442,6 +451,13 @@ test "zooming out preserves the horizontal centre until it reaches a boundary" {
     }
 }
 
+test "zooming in from a centred page keeps its midpoint in view" {
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    _ = viewer.feed(":zoom 50\r:zoom 200\r");
+    try std.testing.expectEqual(400, viewer.state.pan_x);
+}
+
 test "page navigation at minimum zoom fits a one-pixel-wide view" {
     var viewer: TestViewer = undefined;
     viewer.init();
@@ -526,6 +542,29 @@ test "scrolling onto a narrower page brings it into view" {
     for (frame.slices()) |slice| {
         if (slice.tile.page == 1) break;
     } else return error.TestUnexpectedResult;
+}
+
+test "resizing brings a hidden page into view and preserves a visible pan" {
+    var viewer = TestViewer{ .state = .init("doc.pdf", test_size, false, 1) };
+    const pages = [_]document.Size{ .{ .width = 1000, .height = 1000 }, .{ .width = 50, .height = 1000 } };
+    _ = viewer.state.update(.{ .document = .{ .generation = 1, .page_sizes = &pages, .page_offsets = &.{ 0, 1000 } } });
+    _ = viewer.feed(":zoom 800\rG");
+    var size = test_size;
+    size.cols /= 2;
+    _ = viewer.state.update(.{ .resize = size });
+    var frame: Frame = undefined;
+    viewer.state.layout(&frame);
+    for (frame.slices()) |slice| {
+        if (slice.tile.page == 1) break;
+    } else return error.TestUnexpectedResult;
+
+    // Leave only the rightmost 20 px visible, then widen by one cell.
+    _ = viewer.feed("13");
+    _ = viewer.state.update(.{ .key = .right });
+    const pan = viewer.state.pan_x;
+    size.cols += 1;
+    _ = viewer.state.update(.{ .resize = size });
+    try std.testing.expectEqual(pan, viewer.state.pan_x);
 }
 
 test "a view too small to show pages doesn't crash" {
