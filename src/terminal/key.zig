@@ -50,6 +50,9 @@ pub const Key = union(enum) {
             else => {},
         }
         const len = std.unicode.utf8ByteSequenceLength(byte) catch return .{ .key = .unknown, .len = 1 };
+        for (bytes[1..@min(len, bytes.len)], 1..) |continuation, i| {
+            if (continuation & 0xc0 != 0x80) return .{ .key = .unknown, .len = @intCast(i) };
+        }
         if (len > bytes.len) return null;
         const char = std.unicode.utf8Decode(bytes[0..len]) catch return .{ .key = .unknown, .len = len };
         return .{ .key = .{ .char = char }, .len = len };
@@ -126,6 +129,12 @@ test "plain, control and multi-byte keys" {
         .{ .char = 'j' },  .{ .ctrl = 'd' }, .{ .ctrl = 'u' }, .{ .char = ':' },
         .{ .char = 0xe9 }, .enter,           .backspace,
     });
+}
+
+test "a broken UTF-8 sequence leaves the next key intact" {
+    try expectKeys("\xc3q", &.{ .unknown, .{ .char = 'q' } });
+    try expectKeys("\xe2q", &.{ .unknown, .{ .char = 'q' } });
+    try expectKeys("\xf0\x9f\x1b[A", &.{ .unknown, .up });
 }
 
 test "escape sequences for navigation keys" {
