@@ -167,7 +167,7 @@ pub fn main(init: std.process.Init) !void {
         while (keys.len > 0 and viewer.open_error == null) {
             var bytes_buffer: [8]u8 = undefined;
             const bytes, const len = keyBytes(keys, &bytes_buffer) catch |err|
-                std.process.fatal("bad key at '{s}': {t}", .{ keys, err });
+                std.process.fatal("bad key at {q}: {t}", .{ keys, err });
             keys = keys[len..];
             if (viewer.input(bytes)) break;
             // Each harness key is complete, including a standalone Escape.
@@ -175,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
             try settle(io, viewer, emulator, options.timeout_ms);
         }
     }
-    if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });
+    if (viewer.open_error) |err| std.process.fatal("cannot open {q}: {t}", .{ options.file, err });
 
     try fuzzCheck(io, gpa, emulator, viewer, app_options);
 
@@ -221,6 +221,7 @@ fn settle(io: std.Io, viewer: *app.App, emulator: *Emulator, timeout_ms: u32) !v
     const started: std.Io.Timestamp = .now(io, .awake);
     while (true) {
         try viewer.settle(&emulator.output);
+        if (viewer.open_error != null) return;
         var buffer: [app.input_len_max]u8 = undefined;
         while (true) {
             const len = try emulator.input.readSliceShort(&buffer);
@@ -374,7 +375,7 @@ fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size
     viewer.init(io, gpa, app_options, start_size, null);
     defer viewer.deinit();
     try settle(io, viewer, emulator, options.timeout_ms);
-    if (viewer.open_error) |err| std.process.fatal("cannot open '{s}': {t}", .{ options.file, err });
+    if (viewer.open_error) |err| std.process.fatal("cannot open {q}: {t}", .{ options.file, err });
 
     for (0..options.fuzz) |event_index| {
         if (random.uintLessThan(u32, 40) == 0) {

@@ -70,15 +70,15 @@ pub const Diagnostic = struct {
         try t.setColor(.reset);
         switch (stop) {
             error.HelpRequested, error.VersionRequested => unreachable,
-            error.UnknownOption => try t.writer.print(" unknown option '{s}'\n", .{d.subject}),
-            error.MissingValue => try t.writer.print(" option '{s}' requires a value\n", .{d.subject}),
-            error.UnexpectedValue => try t.writer.print(" option '{s}' does not take a value\n", .{d.subject}),
+            error.UnknownOption => try t.writer.print(" unknown option {q}\n", .{d.subject}),
+            error.MissingValue => try t.writer.print(" option {q} requires a value\n", .{d.subject}),
+            error.UnexpectedValue => try t.writer.print(" option {q} does not take a value\n", .{d.subject}),
             error.InvalidValue => try t.writer.print(
-                " invalid value '{s}' for '{s}', expected {s}\n",
+                " invalid value {q} for {q}, expected {s}\n",
                 .{ d.value, d.subject, d.expected },
             ),
             error.MissingArgument => try t.writer.print(" missing required {s}\n", .{d.subject}),
-            error.UnexpectedArgument => try t.writer.print(" unexpected argument '{s}'\n", .{d.subject}),
+            error.UnexpectedArgument => try t.writer.print(" unexpected argument {q}\n", .{d.subject}),
         }
     }
 };
@@ -568,6 +568,15 @@ test "errors name the offending argument" {
     try expectStop(error.InvalidValue, "--mode", &.{ "--mode", "sepia", "a.pdf" });
     try expectStop(error.MissingArgument, "<file>", &.{ "-p", "2" });
     try expectStop(error.UnexpectedArgument, "b.pdf", &.{ "a.pdf", "b.pdf" });
+}
+
+test "diagnostics escape control characters in rejected arguments" {
+    var buffer: [256]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buffer);
+    var diag: Diagnostic = .{};
+    try std.testing.expectError(error.InvalidValue, TestCli.parseArgs(&.{ "--page", "1\x1b[0m\n" }, &diag));
+    try diag.write(error.InvalidValue, .{ .writer = &writer, .mode = .no_color });
+    try std.testing.expectEqualStrings("error: invalid value \"1\\x1b[0m\\n\" for \"--page\", expected an integer\n", writer.buffered());
 }
 
 test "help page aligns all rows and shows defaults" {
