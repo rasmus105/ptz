@@ -44,6 +44,8 @@ pub const Anchor = struct {
     y: f32,
 };
 
+pub const Prefetch = enum { none, above, below };
+
 /// A rectangle of a page as rendered at some size. Equal tiles have equal
 /// pixels, so a tile can name an uploaded image.
 pub const Tile = struct {
@@ -106,7 +108,7 @@ pub const Tiles = struct {
     }
 
     /// Tiles that should be ready, most urgent first: the visible ones, then
-    /// those of the next screen down, then of the screen above.
+    /// those ahead in the scroll direction.
     pub fn wanted(tiles: *const Tiles) []const Tile {
         return tiles.wanted_buffer[0..tiles.wanted_len];
     }
@@ -223,7 +225,7 @@ pub const Geometry = struct {
 // Public API
 // ====================================================================================================
 
-pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, tiles: *Tiles) void {
+pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, prefetch: Prefetch, tiles: *Tiles) void {
     tiles.slices_len = 0;
     tiles.wanted_len = 0;
     tiles.wanted_bytes = 0;
@@ -239,8 +241,11 @@ pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, 
     const origin: Origin = .{ .left = left, .top = top };
     // Visible tiles first, so they also lead the wanted list.
     addTiles(geometry, version, origin, top, top + height, tiles, true);
-    addTiles(geometry, version, origin, top + height, top + 2 * height, tiles, false);
-    addTiles(geometry, version, origin, top - height, top, tiles, false);
+    switch (prefetch) {
+        .none => {},
+        .below => addTiles(geometry, version, origin, top + height, top + 2 * height, tiles, false),
+        .above => addTiles(geometry, version, origin, top - height, top, tiles, false),
+    }
 }
 
 // ====================================================================================================
@@ -350,7 +355,7 @@ test "pages fill the width and are cut into tiles at the view's edges" {
     var tiles: Tiles = undefined;
     // 1300 px down: the last 100 px of page 0's second tile row, the gap,
     // then the first 388 px of page 1.
-    layout(geometry, geometry.anchorAt(1300), 0, test_version, &tiles);
+    layout(geometry, geometry.anchorAt(1300), 0, test_version, .above, &tiles);
     const slices = tiles.slices();
     try std.testing.expectEqual(2, slices.len);
     try std.testing.expectEqual(Slice{
@@ -366,8 +371,7 @@ test "pages fill the width and are cut into tiles at the view's edges" {
         slices[1].tile.page, slices[1].tile.row, slices[1].source_y, slices[1].height, slices[1].y,
     });
 
-    // Wanted: the visible tiles, none new in the screen below (page 1's
-    // first tile reaches past it), then page 0's first tile above.
+    // Scrolling up prepares page 0's first tile after the two visible tiles.
     const wanted = tiles.wanted();
     try std.testing.expectEqual(3, wanted.len);
     try std.testing.expectEqual(.{ 0, 1 }, .{ wanted[0].page, wanted[0].row });
@@ -382,12 +386,12 @@ test "narrow content is centred, and only visible columns of wide content are us
     var tiles: Tiles = undefined;
 
     const zoomed_out: Geometry = .init(&pages, &offsets, test_size, 0.5);
-    layout(zoomed_out, .{ .page = 0, .y = 0 }, 0, test_version, &tiles);
+    layout(zoomed_out, .{ .page = 0, .y = 0 }, 0, test_version, .above, &tiles);
     try std.testing.expectEqual(.{ 200, 400, 0 }, .{ tiles.slices()[0].x, tiles.slices()[0].width, tiles.slices()[0].source_x });
 
     // 8x: 6400 px wide, panned to 4000: columns 1 (2048..4096) and 2.
     const zoomed_in: Geometry = .init(&pages, &offsets, test_size, 8);
-    layout(zoomed_in, .{ .page = 0, .y = 0 }, 4000, test_version, &tiles);
+    layout(zoomed_in, .{ .page = 0, .y = 0 }, 4000, test_version, .above, &tiles);
     const slices = tiles.slices();
     try std.testing.expectEqual(2, slices.len);
     try std.testing.expectEqual(.{ 1, 4000 - tile_width, 96, 0 }, .{ slices[0].tile.column, slices[0].source_x, slices[0].width, slices[0].x });
@@ -415,20 +419,20 @@ test "every visible page is drawn, however many fit on screen" {
     const offsets = testOffsets(&pages);
     const geometry: Geometry = .init(&pages, &offsets, test_size, 1);
     var tiles: Tiles = undefined;
-    layout(geometry, .{ .page = 0, .y = 0 }, 0, test_version, &tiles);
+    layout(geometry, .{ .page = 0, .y = 0 }, 0, test_version, .above, &tiles);
     try std.testing.expectEqual(36, tiles.slices_len);
     try std.testing.expect(tiles.wanted_len <= tiles_max);
 }
 
 test "the wanted tiles stay within the memory bound" {
-    // Zoomed in on long pages, the screens above and below need far more
+    // Zoomed in on long pages, the visible and adjacent screens need far more
     // full tiles than are allowed.
     const pages: [4]document.Size = @splat(.{ .width = 400, .height = 4000 });
     const offsets = testOffsets(&pages);
     const tall: terminal.Size = .{ .cols = 400, .rows = 200, .cell_width = 10, .cell_height = 20 };
     const geometry: Geometry = .init(&pages, &offsets, tall, 8);
     var tiles: Tiles = undefined;
-    layout(geometry, geometry.anchorAt(100_000), 0, test_version, &tiles);
+    layout(geometry, geometry.anchorAt(100_000), 0, test_version, .above, &tiles);
     try std.testing.expect(tiles.slices_len > 0);
     var bytes: u64 = 0;
     for (tiles.wanted()) |tile| bytes += @as(u64, tile.width()) * tile.height() * 4;
@@ -440,7 +444,7 @@ test "extremely tall pages keep render coordinates bounded at maximum zoom" {
     const offsets = testOffsets(&pages);
     const geometry: Geometry = .init(&pages, &offsets, test_size, 1000);
     var tiles: Tiles = undefined;
-    layout(geometry, geometry.anchorAt(geometry.content_height), 0, test_version, &tiles);
+    layout(geometry, geometry.anchorAt(geometry.content_height), 0, test_version, .above, &tiles);
     try std.testing.expect(tiles.slices_len > 0);
     try std.testing.expect(geometry.pageHeight(0) <= page_height_max);
     for (tiles.wanted()) |tile| {

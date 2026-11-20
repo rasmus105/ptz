@@ -230,7 +230,8 @@ fn run(renderer: *Renderer) void {
 }
 
 fn load(renderer: *Renderer) Result {
-    var doc = document.Document.open(renderer.io, renderer.gpa, renderer.path) catch |err|
+    const mode: document.Document.OpenMode = if (renderer.doc == null) .initial else .replacement;
+    var doc = document.Document.openSnapshot(renderer.io, renderer.gpa, renderer.path, mode) catch |err|
         return .{ .open_failed = err };
     const page_count = doc.pageCount();
     const page_sizes = renderer.gpa.alloc(document.Size, page_count) catch {

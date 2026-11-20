@@ -208,8 +208,8 @@ pub const App = struct {
         try app.renderer.collect(&app.results);
         defer app.results.clearRetainingCapacity();
         for (app.results.items) |result| {
-            app.dirty = true;
             app.take(result) catch {
+                app.dirty = true;
                 // Later results may describe a reload the viewer must observe.
                 _ = app.state.update(.{ .message = "out of memory" });
             };
@@ -261,7 +261,7 @@ pub const App = struct {
         while (true) {
             try app.collect();
             if (app.open_error != null) return;
-            try app.draw(output);
+            if (app.dirty) try app.draw(output);
             if (!app.renderer.step() and !app.dirty) return;
         }
     }
@@ -285,7 +285,10 @@ pub const App = struct {
                 const text = std.fmt.bufPrint(&buffer, "reload failed: {t}", .{err}) catch unreachable;
                 _ = app.state.update(.{ .message = text });
             },
-            .tile => |tile| try app.cache.put(app.gpa, tile.tile, tile.encoded),
+            .tile => |tile| {
+                try app.cache.put(app.gpa, tile.tile, tile.encoded);
+                if (!app.cache.needsFrame(tile.tile)) return;
+            },
             .render_failed => |tile| {
                 try app.cache.putFailed(app.gpa, tile);
                 var buffer: [64]u8 = undefined;
@@ -293,6 +296,7 @@ pub const App = struct {
                 _ = app.state.update(.{ .message = text });
             },
         }
+        app.dirty = true;
     }
 };
 
@@ -536,6 +540,38 @@ test "shows the document, and keys move through it" {
     try std.testing.expectEqual([4]u8{ 0, 255, 255, 255 }, dark.pixel(80, 120));
     try std.testing.expectEqual([4]u8{ 0, 0, 0, 255 }, dark.pixel(300, 40));
     try std.testing.expect(app.input("q"));
+}
+
+test "prefetched tiles wait for a visible placement without redrawing" {
+    const gpa = std.testing.allocator;
+    const size: terminal.Size = .{ .cols = 60, .rows = 4, .cell_width = 10, .cell_height = 20 };
+    const emulator: *Emulator = try .create(std.testing.io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(std.testing.io, gpa, .{
+        .path = "src/document/testdata/odd-sizes.pdf",
+        .page = 1,
+        .dark = false,
+        .watch = false,
+        .medium = .direct,
+    }, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+
+    // The first scroll requests page two, but its top still lies below the view.
+    try std.testing.expect(!app.input("j"));
+    try app.draw(&emulator.output);
+    try std.testing.expect(app.renderer.step());
+    try app.collect();
+    try std.testing.expect(!app.dirty);
+
+    // Advance onto page two and draw without letting the renderer run again.
+    try std.testing.expect(!app.input("j"));
+    try app.draw(&emulator.output);
+    const screen = try emulator.screenshot(gpa);
+    defer gpa.free(screen.pixels);
+    try std.testing.expectEqual([4]u8{ 255, 255, 255, 255 }, screen.pixel(300, 48));
 }
 
 test "a tile cache allocation failure preserves a reload in the same batch" {

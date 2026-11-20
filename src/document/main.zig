@@ -67,7 +67,13 @@ pub const Document = struct {
     bytes: []const u8,
     backend: mupdf.Document,
 
+    pub const OpenMode = enum { initial, replacement };
+
     pub fn open(io: std.Io, gpa: std.mem.Allocator, path: []const u8) Error!Document {
+        return openSnapshot(io, gpa, path, .initial);
+    }
+
+    pub fn openSnapshot(io: std.Io, gpa: std.mem.Allocator, path: []const u8, mode: OpenMode) Error!Document {
         const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_size_max)) catch |err| return switch (err) {
             error.FileNotFound => error.FileNotFound,
             error.IsDir => error.IsDir,
@@ -78,7 +84,7 @@ pub const Document = struct {
         };
         errdefer gpa.free(bytes);
 
-        const backend = try mupdf.Document.open(io, bytes);
+        const backend = try mupdf.Document.open(io, bytes, mode);
         return .{ .gpa = gpa, .bytes = bytes, .backend = backend };
     }
 

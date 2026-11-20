@@ -140,6 +140,15 @@ pub fn beginFrame(cache: *Cache, visible: []const Tile) void {
     for (visible) |tile| _ = cache.shown(tile);
 }
 
+/// A completed tile only needs a frame for visible upload or cache eviction.
+pub fn needsFrame(cache: *const Cache, tile: Tile) bool {
+    if (cache.pending_bytes > cache.pending_budget_bytes) return true;
+    for (cache.visible[0..cache.visible_len]) |visible| {
+        if (std.meta.eql(visible, tile)) return true;
+    }
+    return false;
+}
+
 /// Forgets only the failed id. A delayed reply cannot discard a replacement
 /// upload, which receives a fresh id through `put`.
 pub fn reject(cache: *Cache, reply: graphics.Reply) enum { ignored, retry, failed } {

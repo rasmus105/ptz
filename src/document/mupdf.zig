@@ -34,12 +34,12 @@ pub const Document = struct {
     // use and destruction preserves the public document's any-thread contract.
     var engine_lock: std.Io.Mutex = .init;
 
-    pub fn open(io: std.Io, bytes: []const u8) document.Error!Document {
+    pub fn open(io: std.Io, bytes: []const u8, mode: document.Document.OpenMode) document.Error!Document {
         engine_lock.lockUncancelable(io);
         defer engine_lock.unlock(io);
         var handle: ?*Handle = null;
         var count: u32 = undefined;
-        try check(ptz_mupdf_open(bytes.ptr, bytes.len, 512 * 1024 * 1024, &handle, &count));
+        try check(ptz_mupdf_open(bytes.ptr, bytes.len, 512 * 1024 * 1024, @intFromBool(mode == .replacement), &handle, &count));
         return .{ .io = io, .handle = handle.?, .page_count = count };
     }
 
@@ -99,7 +99,7 @@ fn check(status: Status) document.Error!void {
     };
 }
 
-extern fn ptz_mupdf_open(bytes: [*]const u8, length: usize, budget: usize, result: *?*Handle, page_count: *u32) Status;
+extern fn ptz_mupdf_open(bytes: [*]const u8, length: usize, budget: usize, replacement: c_int, result: *?*Handle, page_count: *u32) Status;
 extern fn ptz_mupdf_close(doc: *Handle) void;
 extern fn ptz_mupdf_page_size(doc: *Handle, page: u32, width: *f32, height: *f32) Status;
 extern fn ptz_mupdf_render(doc: *Handle, page: u32, page_width: u32, page_height: u32, x: u32, y: u32, width: u32, height: u32, pixels: [*]u8) Status;
@@ -107,6 +107,14 @@ extern fn ptz_mupdf_render(doc: *Handle, page: u32, page_width: u32, page_height
 // ====================================================================================================
 // Tests
 // ====================================================================================================
+
+test "JPEG opens reject truncated scan data even at reduced validation resolution" {
+    const jpeg = @embedFile("testdata/red-square.jpg");
+    const truncated = jpeg[0 .. jpeg.len - 80];
+    for ([_]document.Document.OpenMode{ .initial, .replacement }) |mode| {
+        try std.testing.expectError(error.InvalidFormat, Document.open(std.testing.io, truncated, mode));
+    }
+}
 
 test "decoder allocations obey a total budget and failures leave the engine usable" {
     const io = std.testing.io;
@@ -116,14 +124,14 @@ test "decoder allocations obey a total budget and failures leave the engine usab
     var handle: ?*Handle = null;
     var count: u32 = undefined;
     const small = @embedFile("testdata/rgba.png");
-    try check(ptz_mupdf_open(small.ptr, small.len, 1024 * 1024, &handle, &count));
+    try check(ptz_mupdf_open(small.ptr, small.len, 1024 * 1024, 0, &handle, &count));
     ptz_mupdf_close(handle.?);
-    const limited = ptz_mupdf_open(bytes.ptr, bytes.len, 1024 * 1024, &handle, &count);
+    const limited = ptz_mupdf_open(bytes.ptr, bytes.len, 1024 * 1024, 0, &handle, &count);
     if (handle) |doc| ptz_mupdf_close(doc);
     try std.testing.expectError(error.FileTooBig, check(limited));
     try std.testing.expectEqual(null, handle);
 
-    try check(ptz_mupdf_open(bytes.ptr, bytes.len, 16 * 1024 * 1024, &handle, &count));
+    try check(ptz_mupdf_open(bytes.ptr, bytes.len, 16 * 1024 * 1024, 0, &handle, &count));
     defer ptz_mupdf_close(handle.?);
     var pixels: [4]u8 = undefined;
     try check(ptz_mupdf_render(handle.?, 0, 1, 1, 0, 0, 1, 1, &pixels));
@@ -139,7 +147,7 @@ test "multipage images remain viewable when decoded pages exceed the cache budge
     const bytes = @embedFile("testdata/cache.tiff");
     var handle: ?*Handle = null;
     var count: u32 = undefined;
-    try check(ptz_mupdf_open(bytes.ptr, bytes.len, 3 * 1024 * 1024, &handle, &count));
+    try check(ptz_mupdf_open(bytes.ptr, bytes.len, 3 * 1024 * 1024, 0, &handle, &count));
     defer ptz_mupdf_close(handle.?);
     try std.testing.expectEqual(@as(u32, 6), count);
     const colors = [_][4]u8{

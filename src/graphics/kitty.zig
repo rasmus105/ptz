@@ -50,20 +50,21 @@ pub fn detect(input: *std.Io.Reader, output: *std.Io.Writer) terminal.Error!?gra
     return null;
 }
 
-/// Compresses (zlib) and base64-encodes RGBA pixels. Pages are mostly
-/// uniform background, so compression shrinks what the terminal has to
-/// receive and decode many times over, which dominates display time.
+/// Compresses RGBA before Base64 encoding to keep inline uploads small.
 pub fn encode(gpa: std.mem.Allocator, pixels: []const u8) ![]u8 {
-    var compressed: std.Io.Writer.Allocating = try .initCapacity(gpa, pixels.len / 16 + 64);
-    defer compressed.deinit();
-    var window: [std.compress.flate.max_window_len]u8 = undefined;
-    var zlib: std.compress.flate.Compress = try .init(&compressed.writer, &window, .zlib, .fastest);
-    try zlib.writer.writeAll(pixels);
-    try zlib.finish();
+    const compressed = try gpa.alloc(u8, compressBound(pixels.len));
+    defer gpa.free(compressed);
+    var len: c_ulong = compressed.len;
+    // Level 1 keeps inline encoding from stalling the render worker on text pages.
+    switch (compress2(compressed.ptr, &len, pixels.ptr, pixels.len, 1)) {
+        0 => {},
+        -4 => return error.OutOfMemory,
+        else => return error.Unexpected,
+    }
 
     const encoder = std.base64.standard.Encoder;
-    const base64 = try gpa.alloc(u8, encoder.calcSize(compressed.written().len));
-    _ = encoder.encode(base64, compressed.written());
+    const base64 = try gpa.alloc(u8, encoder.calcSize(len));
+    _ = encoder.encode(base64, compressed[0..len]);
     return base64;
 }
 
@@ -149,6 +150,14 @@ pub fn parseReply(bytes: []const u8) ?graphics.Reply {
         .status = if (std.mem.eql(u8, message, "OK")) .ok else if (std.mem.startsWith(u8, message, "ENOENT:")) .not_found else .rejected,
     };
 }
+
+// ====================================================================================================
+// Private Functions
+// ====================================================================================================
+
+// zlib is already linked into both supported builds through MuPDF.
+extern fn compressBound(len: c_ulong) c_ulong;
+extern fn compress2(out: [*]u8, out_len: *c_ulong, input: [*]const u8, input_len: c_ulong, level: c_int) c_int;
 
 // ====================================================================================================
 // Tests

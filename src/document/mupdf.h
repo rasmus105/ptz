@@ -17,7 +17,7 @@ typedef enum {
 } ptz_status;
 
 /* The caller retains bytes until close. All calls must be serialized. */
-ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budget,
+ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budget, int replacement,
                           ptz_document **result, uint32_t *page_count);
 void ptz_mupdf_close(ptz_document *doc);
 ptz_status ptz_mupdf_page_size(ptz_document *doc, uint32_t page, float *width, float *height);

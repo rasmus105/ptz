@@ -1,5 +1,6 @@
 #include "mupdf.h"
 #include "mupdf/fitz.h"
+#include "mupdf/pdf.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -188,20 +189,29 @@ static ptz_status caught_error(ptz_document *doc)
     return PTZ_INVALID_FORMAT;
 }
 
+typedef struct {
+    fz_device device;
+    int scaled_jpeg;
+} ValidationDevice;
+
 /* Raw image handlers can expose several pages and defer pixel decoding. A
  * validation device checks every image through the public device interface,
  * without depending on the handler's private page layout. */
 static void validate_image(fz_context *ctx, fz_device *device, fz_image *image,
                            fz_matrix transform, float alpha, fz_color_params params)
 {
-    (void)device;
     (void)transform;
     (void)alpha;
     (void)params;
     if (image->w > IMAGE_DIMENSION_MAX || image->h > IMAGE_DIMENSION_MAX ||
         (uint64_t)image->w * (uint64_t)image->h > IMAGE_PIXELS_MAX)
         fz_throw(ctx, FZ_ERROR_LIMIT, "image too large");
-    fz_pixmap *pixmap = fz_get_unscaled_pixmap_from_image(ctx, image);
+    /* JPEG reads the full entropy stream at 1/8 IDCT scale. MuPDF needs two
+     * pixels of slack when selecting this scale. Replacements still have to
+     * pass the full-resolution allocation check. */
+    fz_matrix target = fz_scale(fmaxf(1, (image->w >> 3) - 2), fmaxf(1, (image->h >> 3) - 2));
+    fz_pixmap *pixmap = fz_get_pixmap_from_image(ctx, image, NULL,
+        ((ValidationDevice *)device)->scaled_jpeg ? &target : NULL, NULL, NULL);
     fz_drop_pixmap(ctx, pixmap);
 }
 
@@ -262,7 +272,7 @@ void ptz_mupdf_close(ptz_document *doc)
     free(doc);
 }
 
-ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budget,
+ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budget, int replacement,
                           ptz_document **result, uint32_t *page_count)
 {
     *result = NULL;
@@ -308,7 +318,7 @@ ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budg
 
         unsigned char signature[8] = {0};
         if (length >= sizeof(signature)) memcpy(signature, bytes, sizeof(signature));
-        int raster = length >= sizeof(signature) && fz_recognize_image_format(ctx, signature) != FZ_IMAGE_UNKNOWN;
+        int format = length >= sizeof(signature) ? fz_recognize_image_format(ctx, signature) : FZ_IMAGE_UNKNOWN;
 
         /* UTF-8 BOM is valid XML, but the native SVG recognizer skips only
          * whitespace. The stream remains an immutable slice of our snapshot. */
@@ -333,8 +343,10 @@ ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budg
             if (doc->page_count < 0) fz_throw(ctx, FZ_ERROR_FORMAT, "negative page count");
             /* Native image documents defer validation until a page is loaded.
              * Validate before a reload is allowed to replace a good snapshot. */
-            if (raster) {
-                validator = fz_new_device_of_size(ctx, sizeof(fz_device));
+            if (format != FZ_IMAGE_UNKNOWN) {
+                int scaled_jpeg = !replacement && format == FZ_IMAGE_JPEG;
+                validator = fz_new_device_of_size(ctx, sizeof(ValidationDevice));
+                ((ValidationDevice *)validator)->scaled_jpeg = scaled_jpeg;
                 validator->fill_image = validate_image;
                 for (int page = 0; page < doc->page_count; page++) {
                     LoadedPage *loaded = load_page(doc, page);
@@ -342,9 +354,9 @@ ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budg
                     fz_run_page(ctx, loaded->page, validator, fz_identity, &cookie);
                     if (cookie.errors || cookie.incomplete)
                         fz_throw(ctx, FZ_ERROR_FORMAT, "cannot decode image completely");
-                    /* Validation visits every page, but need not retain their
-                     * decoded pixels while opening a multipage image. */
-                    drop_pages(doc);
+                    /* A JPEG's first tiles can reuse its validated image. Keep
+                     * multipage validation bounded to a single decoded page. */
+                    if (!scaled_jpeg) drop_pages(doc);
                 }
                 fz_close_device(ctx, validator);
                 /* PNG and JPEG decoders can repair truncated pixels with only
@@ -378,9 +390,20 @@ ptz_status ptz_mupdf_page_size(ptz_document *doc, uint32_t page, float *width, f
         uint64_t errors = doc->errors;
         ptz_status status = PTZ_OK;
         fz_try(doc->ctx) {
-            LoadedPage *loaded = load_page(doc, (int)page);
-            *width = loaded->bounds.x1 - loaded->bounds.x0;
-            *height = loaded->bounds.y1 - loaded->bounds.y0;
+            fz_rect bounds;
+            pdf_document *pdf = pdf_specifics(doc->ctx, doc->handle);
+            if (pdf) {
+                /* Layout needs the transformed crop box. Loading a PDF page
+                 * would also initialize its links and annotations. */
+                pdf_obj *obj = pdf_lookup_page_obj(doc->ctx, pdf, (int)page);
+                fz_matrix matrix;
+                pdf_page_obj_transform_box(doc->ctx, obj, &bounds, &matrix, FZ_CROP_BOX);
+                bounds = fz_transform_rect(bounds, matrix);
+            } else {
+                bounds = load_page(doc, (int)page)->bounds;
+            }
+            *width = bounds.x1 - bounds.x0;
+            *height = bounds.y1 - bounds.y0;
         }
         fz_catch(doc->ctx) {
             status = caught_error(doc);

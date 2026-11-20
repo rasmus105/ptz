@@ -91,8 +91,7 @@ pub const Frame = struct {
         return frame.tiles.slices();
     }
 
-    /// Most urgent first: the visible tiles, then those of the next screen
-    /// down, then of the screen above.
+    /// Visible tiles first, followed by any tiles ahead in the scroll direction.
     pub fn wanted(frame: *const Frame) []const Tile {
         return frame.tiles.wanted();
     }
@@ -114,6 +113,7 @@ pub const State = struct {
     /// Derived from the document, size and zoom; see `relayout`.
     geometry: tiling.Geometry,
     anchor: Anchor,
+    prefetch: tiling.Prefetch,
     /// Horizontal scroll in pixels when the pages are wider than the window.
     pan_x: u32,
     /// 1 fits the widest page to the window width.
@@ -135,6 +135,7 @@ pub const State = struct {
             .document = .{ .generation = 0, .page_sizes = &.{}, .page_offsets = &.{} },
             .geometry = undefined,
             .anchor = .{ .page = page -| 1, .y = 0 },
+            .prefetch = .none,
             .pan_x = 0,
             .zoom = 1,
             .dark = dark,
@@ -184,7 +185,7 @@ pub const State = struct {
         tiling.layout(state.geometry, state.anchor, state.pan_x, .{
             .generation = state.document.generation,
             .dark = state.dark,
-        }, &frame.tiles);
+        }, state.prefetch, &frame.tiles);
         state.writeStatus(frame);
     }
 
@@ -203,7 +204,10 @@ pub const State = struct {
             .goto_last_page => state.gotoPage(std.math.maxInt(i32)),
             .zoom_steps => |n| state.setZoom(state.zoom * std.math.pow(f32, zoom_step, @floatFromInt(n))),
             .zoom_fit_width => state.setZoom(1),
-            .toggle_dark => state.dark = !state.dark,
+            .toggle_dark => {
+                state.dark = !state.dark;
+                state.prefetch = .none;
+            },
             .open_command_line => {
                 state.command_open = true;
                 state.command_len = 0;
@@ -215,6 +219,7 @@ pub const State = struct {
 
     fn scrollBy(state: *State, delta: i64) void {
         if (state.document.page_sizes.len == 0) return;
+        state.prefetch = if (delta > 0) .below else .above;
         const page = state.centrePage();
         state.anchor = state.geometry.anchorAt(state.geometry.offsetOf(state.anchor) + delta);
         if (state.centrePage() != page) state.panToPage(state.centrePage(), .always);
@@ -226,6 +231,7 @@ pub const State = struct {
     }
 
     fn gotoPage(state: *State, page: i64) void {
+        state.prefetch = .none;
         const pages = state.document.page_sizes.len;
         if (pages == 0) return;
         const anchor: Anchor = .{ .page = @intCast(std.math.clamp(page, 0, @as(i64, @intCast(pages - 1)))), .y = 0 };
@@ -267,6 +273,7 @@ pub const State = struct {
     /// Recomputes the geometry after the document, size or zoom changed, and
     /// keeps the position inside the document.
     fn relayout(state: *State) void {
+        state.prefetch = .none;
         state.geometry = .init(state.document.page_sizes, state.document.page_offsets, state.size, state.zoom);
         const pages = state.document.page_sizes.len;
         if (pages == 0) return;
@@ -418,6 +425,22 @@ test "page jumps and counts" {
     try std.testing.expectEqual(2, viewer.state.anchor.page);
     _ = viewer.feed("2h");
     try std.testing.expectEqual(0, viewer.state.anchor.page);
+}
+
+test "scrolling prepares the next screen, while page jumps and zoom request only visible tiles" {
+    var viewer: TestViewer = undefined;
+    viewer.init();
+    var frame: Frame = undefined;
+    _ = viewer.feed("2G2j");
+    viewer.state.layout(&frame);
+    try std.testing.expect(frame.wanted().len > frame.slices().len);
+    try std.testing.expectEqual(1, frame.wanted()[frame.slices().len].row);
+
+    for ([_][]const u8{ "3G", "2j+" }) |keys| {
+        _ = viewer.feed(keys);
+        viewer.state.layout(&frame);
+        try std.testing.expectEqual(frame.slices().len, frame.wanted().len);
+    }
 }
 
 test "zooming keeps the position in the page and the centre of the view" {
