@@ -37,6 +37,7 @@ jobs:
         run: |
           dir="ptz-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
           cp LICENSE NOTICE README.md "$dir/"
+          cp -R packaging/completions "$dir/"
           COPYFILE_DISABLE=1 tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:

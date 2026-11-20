@@ -1,0 +1,3 @@
+#compdef ptz
+
+_path_files -/ -g '(#i)*.(pdf|epub|xps|oxps|cbz|cbt|fb2|mobi|prc|pdb|svg|png|jpg|jpeg|jpe|jfif|jfif-tbnl|tif|tiff|jp2|j2k|jpx|bmp|psd|gif|pnm|pbm|pgm|ppm|pam|pfm)(-.)'

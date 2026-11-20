@@ -21,6 +21,9 @@ class Ptz < Formula
 
   def install
     bin.install "bin/ptz"
+    bash_completion.install "completions/ptz.bash" => "ptz"
+    zsh_completion.install "completions/_ptz"
+    fish_completion.install "completions/ptz.fish"
     pkgshare.install Dir["share/ptz/*"]
   end
 
