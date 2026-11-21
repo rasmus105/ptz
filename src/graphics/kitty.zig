@@ -110,9 +110,12 @@ pub fn transmit(writer: *std.Io.Writer, id: graphics.ImageId, encoded: graphics.
 pub fn place(writer: *std.Io.Writer, placement: graphics.Placement) std.Io.Writer.Error!void {
     const source = placement.source;
     try terminal.moveCursor(writer, placement.row, placement.col);
+    // This layer is below explicit cell backgrounds as well as glyphs.
+    const base: i32 = if (placement.behind_text) -1073741828 else 0;
+    const z = base + placement.layer;
     try writer.print(
-        "\x1b_Ga=p,i={d},p=1,x={d},y={d},w={d},h={d},X={d},Y={d},C=1,q=1\x1b\\",
-        .{ placement.image, source.x, source.y, source.width, source.height, placement.x_offset, placement.y_offset },
+        "\x1b_Ga=p,i={d},p={d},x={d},y={d},w={d},h={d},X={d},Y={d},z={d},C=1,q=1\x1b\\",
+        .{ placement.image, placement.placement, source.x, source.y, source.width, source.height, placement.x_offset, placement.y_offset, z },
     );
 }
 
