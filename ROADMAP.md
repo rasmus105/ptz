@@ -27,9 +27,15 @@
 - [x] SVG (MuPDF's supported subset)
 - [x] Multipage images
 
+## v0.4.0
+
+- [x] Follow visible links with keyboard hints (`f`) and preview web addresses before opening them
+- [x] Reimplement text search on MuPDF (`/`, `n` / `N`), with highlights and repeats from the selected match
+- [x] Restore jump history (`Ctrl-o` / `Ctrl-i`) and fix `Ctrl-i` in terminals that send CSI-u
+- [x] Add shell completions for Bash, Zsh, and Fish
+
 ## vX.Y.Z
 
-- [ ] Follow links (`f` like vimium)
 - [ ] Text selection/copying??
 - [ ] Remember last position? (local state)
 - [ ] Tmux support
