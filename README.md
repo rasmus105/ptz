@@ -42,11 +42,15 @@ ptz photo.jpg
 | `gg` / `G`, `{n}G` | First / last page, page `n` |
 | `+` / `-` / `=` | Zoom in / out / fit width |
 | `Left` / `Right` | Pan when zoomed in |
+| `f` | Show hints for visible links. Type a hint to follow it, `Backspace` to edit, `Tab` for more, or `Esc` to cancel |
+| `Ctrl-o` / `Ctrl-i` (`Tab`) | Go back / forward through link jumps |
 | `i` | Toggle dark mode |
 | `:` | Command line: `:{n}`, `:zoom {percent}`, `:dark`, `:reload`, `:q` |
 | `q`, `Ctrl-c` | Quit |
 
 Counts work as in Vim, e.g. `5j` or `3l`.
+Check the address of an HTTP(S) link and press `Enter` to open it in your browser.
+International addresses use percent-encoded paths and Punycode hostnames.
 
 ## Dependencies
 

@@ -18,6 +18,7 @@ const terminal = @import("../terminal/main.zig");
 
 // local
 const keymap = @import("keymap.zig");
+const links = @import("links.zig");
 const tiling = @import("tiling.zig");
 
 // ====================================================================================================
@@ -43,6 +44,16 @@ pub const Slice = tiling.Slice;
 pub const Anchor = tiling.Anchor;
 pub const tiles_max = tiling.tiles_max;
 pub const wanted_bytes_max = tiling.wanted_bytes_max;
+pub const LinkRequest = links.Request;
+pub const links_max = links.links_max;
+
+pub const LinkResult = struct {
+    id: u64,
+    links: []const document.Link,
+    incomplete: bool,
+};
+
+const Position = struct { anchor: Anchor, pan_x: u32, zoom: f32 };
 
 /// A loaded version of the document.
 pub const Document = struct {
@@ -62,12 +73,20 @@ pub const Event = union(enum) {
     /// A document was (re)loaded. Its slices must stay valid until the next
     /// `document` event. The position is kept, clamped to the document.
     document: Document,
+    links: LinkResult,
     /// Something to tell the user, e.g. that a reload failed.
     message: []const u8,
 };
 
 /// What the shell should do after an event.
-pub const Effect = enum { none, quit, reload };
+pub const Effect = union(enum) {
+    none,
+    quit,
+    reload,
+    find_links,
+    cancel_links,
+    open_url: []const u8,
+};
 
 /// The status line: `left` is truncated to make room for `right`.
 pub const Status = struct {
@@ -86,6 +105,9 @@ pub const Frame = struct {
     status_left_len: u32,
     status_right_len: u32,
     status_keep_end: bool,
+    labels: []const links.Label,
+    hint_prefix: []const u8,
+    preview: ?document.Link.Web,
 
     pub fn slices(frame: *const Frame) []const Slice {
         return frame.tiles.slices();
@@ -120,12 +142,16 @@ pub const State = struct {
     zoom: f32,
     dark: bool,
     keymap: keymap.KeyMap,
-    /// Whether the `:` command line is open, and what has been typed.
-    command_open: bool,
+    command_open: bool = false,
     command_buffer: [command_len_max]u8,
     command_len: u32,
     message_buffer: [message_len_max]u8,
     message_len: u32,
+    hints: links.Hints = .{},
+    /// Positions on either side of link jumps, in chronological order.
+    jumps: [64]Position = undefined,
+    jump_index: usize = 0,
+    jump_end: usize = 0,
 
     /// Starts at `page`, counting from 1, once the document is loaded.
     pub fn init(file_name: []const u8, size: terminal.Size, dark: bool, page: u32) State {
@@ -139,7 +165,6 @@ pub const State = struct {
             .zoom = 1,
             .dark = dark,
             .keymap = .{},
-            .command_open = false,
             .command_buffer = undefined,
             .command_len = 0,
             .message_buffer = undefined,
@@ -153,24 +178,43 @@ pub const State = struct {
         switch (event) {
             .key => |key| {
                 state.message_len = 0;
+                if (state.hints.mode != .off) return state.editHints(key);
                 if (state.command_open) return state.editCommand(key);
-                const action = state.keymap.feed(key) orelse return .none;
-                return state.apply(action);
+                return state.apply(state.keymap.feed(key) orelse return .none);
             },
             .resize => |size| {
+                const changed = !std.meta.eql(size, state.size);
+                const cancel_lookup = changed and state.hints.mode == .loading;
+                if (changed and state.hints.mode != .confirm) state.hints.close();
                 const old_width = state.geometry.view_width;
                 state.size = size;
                 state.relayout();
                 if (state.geometry.view_width != old_width and state.document.page_sizes.len > 0)
                     state.panToPage(state.centrePage(), .if_hidden);
+                if (cancel_lookup) return .cancel_links;
             },
             .document => |doc| {
                 std.debug.assert(doc.page_offsets.len == doc.page_sizes.len);
                 std.debug.assert(doc.generation > state.document.generation);
                 // Clears e.g. an earlier "reload failed".
                 state.message_len = 0;
+                state.hints.close();
+                state.jump_index = 0;
+                state.jump_end = 0;
                 state.document = doc;
                 state.relayout();
+            },
+            .links => |result| {
+                if (!state.expectsLinks(result.id)) return .none;
+                std.debug.assert(result.links.len <= links_max);
+                if (result.links.len == 0) {
+                    state.hints.close();
+                    return state.update(.{ .message = if (result.incomplete) "Could not read links in view" else "No links in view" });
+                }
+                state.hints.mode = .select;
+                state.hints.links = result.links;
+                state.hints.incomplete = result.incomplete;
+                state.hints.show(state.geometry, state.size, state.anchor, state.pan_x);
             },
             .message => |text| {
                 state.message_len = @intCast(@min(text.len, message_len_max));
@@ -185,7 +229,23 @@ pub const State = struct {
             .generation = state.document.generation,
             .dark = state.dark,
         }, &frame.tiles);
+        const hints = &state.hints;
+        frame.labels = if (hints.mode == .select) hints.labels[0..hints.count] else &.{};
+        frame.hint_prefix = hints.prefix[0..hints.prefix_len];
+        frame.preview = hints.preview;
         state.writeStatus(frame);
+    }
+
+    pub fn expectsLinks(state: *const State, id: u64) bool {
+        return state.hints.mode == .loading and state.hints.request_id == id;
+    }
+
+    pub fn linkRequest(state: *const State) LinkRequest {
+        return .init(state.hints.request_id, state.document.generation, state.geometry, state.anchor, state.pan_x);
+    }
+
+    pub fn linkPreviewOpen(state: *const State) bool {
+        return state.hints.mode == .confirm;
     }
 
     fn apply(state: *State, action: keymap.Action) Effect {
@@ -207,6 +267,28 @@ pub const State = struct {
             .open_command_line => {
                 state.command_open = true;
                 state.command_len = 0;
+            },
+            .follow_link => {
+                if (state.document.generation == 0)
+                    return state.update(.{ .message = "Still loading the document" });
+                if (state.document.page_sizes.len == 0 or state.geometry.view_height == 0)
+                    return state.update(.{ .message = "No links in view" });
+                state.hints.request_id = @max(1, state.hints.request_id +% 1);
+                state.hints.mode = .loading;
+                return .find_links;
+            },
+            .older_link_jump, .newer_link_jump => {
+                const index = state.jump_index;
+                if ((action == .older_link_jump and index == 0) or
+                    (action == .newer_link_jump and index == state.jump_end))
+                    return state.update(.{ .message = if (action == .older_link_jump) "No earlier jump" else "No later jump" });
+                state.jumps[index] = state.position();
+                state.jump_index = if (action == .older_link_jump) index - 1 else index + 1;
+                const saved = state.jumps[state.jump_index];
+                state.anchor = saved.anchor;
+                state.pan_x = saved.pan_x;
+                state.zoom = saved.zoom;
+                state.relayout();
             },
             .quit => return .quit,
         }
@@ -275,6 +357,95 @@ pub const State = struct {
         state.pan_x = @min(state.pan_x, state.geometry.panMax());
     }
 
+    fn editHints(state: *State, key: terminal.Key) Effect {
+        const hints = &state.hints;
+        if (key == .ctrl and key.ctrl == 'c') return .quit;
+        if (key == .escape or (key == .backspace and (hints.mode != .select or hints.prefix_len == 0))) {
+            const cancel_lookup = hints.mode == .loading;
+            hints.close();
+            return if (cancel_lookup) .cancel_links else .none;
+        }
+        switch (hints.mode) {
+            .off => unreachable,
+            .loading => {},
+            .confirm => if (key == .enter) {
+                const preview = hints.preview.?;
+                if (preview.authority_end > @as(usize, state.size.cols) * (state.size.rows - 1)) return .none;
+                hints.close();
+                return .{ .open_url = preview.uri };
+            },
+            .select => switch (key) {
+                .tab => if (hints.more()) {
+                    hints.show(state.geometry, state.size, state.anchor, state.pan_x);
+                },
+                .backspace => hints.prefix_len -= 1,
+                .char => |char| {
+                    if (char > 0x7f) return .none;
+                    hints.prefix[hints.prefix_len] = @intCast(char);
+                    const prefix = hints.prefix[0 .. hints.prefix_len + 1];
+                    for (hints.labels[0..hints.count]) |*label| {
+                        if (!std.mem.startsWith(u8, label.text(), prefix)) continue;
+                        if (prefix.len < label.len) {
+                            hints.prefix_len += 1;
+                            return .none;
+                        }
+                        switch (hints.links[label.link].target) {
+                            .url => |url| {
+                                hints.preview = url;
+                                hints.mode = .confirm;
+                            },
+                            .position => |dest| {
+                                hints.close();
+                                state.followPosition(dest);
+                            },
+                        }
+                        return .none;
+                    }
+                    return state.update(.{ .message = "No matching hint" });
+                },
+                else => {},
+            },
+        }
+        return .none;
+    }
+
+    fn followPosition(state: *State, dest: document.Destination) void {
+        const origin = state.position();
+        const geometry = state.geometry;
+        const height = geometry.pageHeight(dest.page);
+        const y = std.math.clamp(dest.y orelse 0, 0, 1);
+        const offset = @min(height - 1, @as(u32, @intFromFloat(@round(y * @as(f32, @floatFromInt(height))))));
+        // Leave a row of context above coordinates within a page.
+        state.anchor = geometry.anchorAt(geometry.pageTop(dest.page) + (offset -| state.size.cell_height));
+        state.panToPage(dest.page, .always);
+        if (dest.x) |x| {
+            const width = geometry.pageWidth(dest.page);
+            if (width > geometry.view_width) {
+                const page_left = (geometry.content_width -| width) / 2;
+                const fraction = std.math.clamp(x, 0, 1);
+                const target_x = page_left + @min(width - 1, @as(u32, @intFromFloat(@round(fraction * @as(f32, @floatFromInt(width))))));
+                if (target_x < state.pan_x or target_x >= state.pan_x + geometry.view_width)
+                    state.pan_x = std.math.clamp(target_x -| state.size.cell_width, page_left, page_left + width - geometry.view_width);
+            }
+        }
+        state.recordJump(origin);
+    }
+
+    fn position(state: *const State) Position {
+        return .{ .anchor = state.anchor, .pan_x = state.pan_x, .zoom = state.zoom };
+    }
+
+    fn recordJump(state: *State, origin: Position) void {
+        if (std.meta.eql(origin, state.position())) return;
+        if (state.jump_index + 1 == state.jumps.len) {
+            std.mem.copyForwards(Position, state.jumps[0 .. state.jump_index - 1], state.jumps[1..state.jump_index]);
+            state.jump_index -= 1;
+        }
+        state.jumps[state.jump_index] = origin;
+        state.jump_index += 1;
+        state.jump_end = state.jump_index;
+    }
+
     fn editCommand(state: *State, key: terminal.Key) Effect {
         std.debug.assert(state.command_open);
         switch (key) {
@@ -299,8 +470,8 @@ pub const State = struct {
             .escape, .ctrl => state.command_open = false,
             .enter => {
                 state.command_open = false;
-                const line = std.mem.trim(u8, state.command_buffer[0..state.command_len], " ");
-                return state.runCommand(line);
+                const line = state.command_buffer[0..state.command_len];
+                return state.runCommand(std.mem.trim(u8, line, " "));
             },
             else => {},
         }
@@ -345,6 +516,41 @@ pub const State = struct {
             return;
         }
         const message = state.message_buffer[0..state.message_len];
+        const hints = &state.hints;
+        if (hints.mode != .off) {
+            switch (hints.mode) {
+                .off => unreachable,
+                .loading => writer.writeAll("Finding links...  Esc cancel") catch {},
+                .select => {
+                    if (message.len > 0) {
+                        writer.print("{s}  ", .{message}) catch {};
+                    } else if (hints.prefix_len > 0) {
+                        writer.print("Link: {s}  Backspace undo  ", .{hints.prefix[0..hints.prefix_len]}) catch {};
+                    } else {
+                        writer.writeAll("Type a link hint  ") catch {};
+                    }
+                    writer.writeAll("Esc cancel") catch {};
+                    if (hints.incomplete) writer.writeAll("  Some links unavailable") catch {};
+                },
+                .confirm => {
+                    const preview = hints.preview.?;
+                    const capacity = @as(usize, state.size.cols) * (state.size.rows - 1);
+                    writer.writeAll(if (preview.authority_end > capacity)
+                        "Enlarge to open  Esc cancel"
+                    else if (capacity == preview.authority_end and preview.uri.len > capacity)
+                        // The address panel has no room for an ellipsis after the host.
+                        "URL cut  Enter open"
+                    else
+                        "Enter open in browser  Esc cancel") catch {};
+                },
+            }
+            frame.status_left_len = @intCast(writer.end);
+            if (hints.mode == .select and hints.more()) writer.print("Tab {d}-{d}/{d}", .{
+                hints.shown_count - hints.count + 1, hints.shown_count, hints.links.len,
+            }) catch {};
+            frame.status_right_len = @intCast(writer.end - frame.status_left_len);
+            return;
+        }
         writer.writeAll(if (message.len > 0) message else state.file_name) catch {};
         frame.status_left_len = @intCast(writer.end);
         const pages = state.document.page_sizes.len;
@@ -370,6 +576,7 @@ pub const State = struct {
 
 test {
     _ = keymap;
+    _ = links;
     _ = tiling;
 }
 

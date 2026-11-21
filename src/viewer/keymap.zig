@@ -37,6 +37,9 @@ pub const Action = union(enum) {
     zoom_fit_width,
     toggle_dark,
     open_command_line,
+    follow_link,
+    older_link_jump,
+    newer_link_jump,
     quit,
 };
 
@@ -79,6 +82,7 @@ pub const KeyMap = struct {
                 '-' => .{ .zoom_steps = -n },
                 '=' => .zoom_fit_width,
                 'i' => .toggle_dark,
+                'f' => .follow_link,
                 ':' => .open_command_line,
                 'q' => .quit,
                 else => null,
@@ -88,6 +92,8 @@ pub const KeyMap = struct {
                 'u' => .{ .scroll_half_screens = -n },
                 'f' => .{ .scroll_screens = n },
                 'b' => .{ .scroll_screens = -n },
+                'o' => .older_link_jump,
+                'i' => .newer_link_jump,
                 'c' => .quit,
                 else => null,
             },
@@ -97,9 +103,10 @@ pub const KeyMap = struct {
             .left => .{ .pan_lines = -n },
             .page_down => .{ .scroll_screens = n },
             .page_up => .{ .scroll_screens = -n },
+            .tab => .newer_link_jump,
             .home => .{ .goto_page = 1 },
             .end => .goto_last_page,
-            // Escape only cancels the pending count and `g`, done above.
+            // Escape cancels the pending count and `g`, done above.
             else => null,
         };
     }

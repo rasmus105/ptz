@@ -1,8 +1,8 @@
 //! Renders tiles on a thread of its own, and owns the document while doing
 //! so: every engine call happens here, so the UI never waits on the engine.
 //!
-//! The UI asks for work with `reload` and `want`, and picks up `Result`s with
-//! `collect`; `wake_fd` gets a byte whenever new results are ready. `step`
+//! The UI requests reloads, link lookups and tiles. It picks up `Result`s
+//! with `collect`; `wake_fd` gets a byte whenever new results are ready. `step`
 //! does one unit of work on the calling thread. The thread only loops over
 //! it, and tests call it directly to run deterministically.
 
@@ -26,6 +26,7 @@ pub const Result = union(enum) {
     /// The document was (re)loaded; owns the slices. See `viewer.Document`.
     opened: struct { generation: u32, page_sizes: []document.Size, page_offsets: []f64 },
     open_failed: document.Error,
+    links: struct { view: viewer.LinkResult, arena: std.heap.ArenaAllocator },
     tile: struct { tile: Tile, encoded: graphics.Encoded },
     render_failed: Tile,
 
@@ -36,6 +37,7 @@ pub const Result = union(enum) {
                 gpa.free(opened.page_offsets);
             },
             .tile => |tile| tile.encoded.deinit(gpa),
+            .links => |links| links.arena.deinit(),
             .open_failed, .render_failed => {},
         }
     }
@@ -51,12 +53,16 @@ path: []const u8,
 medium: graphics.Medium,
 wake_fd: ?std.posix.fd_t,
 thread: ?std.Thread,
+/// The newest link lookup, or 0 when canceled. Checked between engine calls.
+link_id: std.atomic.Value(u64),
 
 mutex: std.Io.Mutex,
 condition: std.Io.Condition,
 // Guarded by `mutex`:
 reload_requested: bool,
+/// A reload or lookup is running without the mutex held.
 loading: bool,
+link_request: ?viewer.LinkRequest,
 /// Tiles to render, most urgent first. Replaced as a whole by `want`.
 wanted: [viewer.tiles_max]Tile,
 wanted_len: u32,
@@ -90,10 +96,12 @@ pub fn init(
         .medium = medium,
         .wake_fd = wake_fd,
         .thread = null,
+        .link_id = .init(0),
         .mutex = .init,
         .condition = .init,
         .reload_requested = true,
         .loading = false,
+        .link_request = null,
         .wanted = undefined,
         .wanted_len = 0,
         .rendering = null,
@@ -108,6 +116,7 @@ pub fn deinit(renderer: *Renderer) void {
     if (renderer.thread) |thread| {
         renderer.mutex.lockUncancelable(renderer.io);
         renderer.stopping = true;
+        renderer.link_id.store(0, .monotonic);
         renderer.condition.signal(renderer.io);
         renderer.mutex.unlock(renderer.io);
         thread.join();
@@ -132,6 +141,21 @@ pub fn reload(renderer: *Renderer) void {
     renderer.condition.signal(renderer.io);
 }
 
+pub fn findLinks(renderer: *Renderer, request: viewer.LinkRequest) void {
+    renderer.mutex.lockUncancelable(renderer.io);
+    defer renderer.mutex.unlock(renderer.io);
+    renderer.link_request = request;
+    renderer.link_id.store(request.id, .monotonic);
+    renderer.condition.signal(renderer.io);
+}
+
+pub fn cancelLinks(renderer: *Renderer) void {
+    renderer.mutex.lockUncancelable(renderer.io);
+    defer renderer.mutex.unlock(renderer.io);
+    renderer.link_request = null;
+    renderer.link_id.store(0, .monotonic);
+}
+
 /// Replaces the tiles to render, most urgent first. Tiles being rendered or
 /// waiting to be collected are left out, so they aren't rendered twice.
 pub fn want(renderer: *Renderer, tiles: []const Tile) void {
@@ -144,7 +168,7 @@ pub fn want(renderer: *Renderer, tiles: []const Tile) void {
         for (renderer.results.items) |result| switch (result) {
             .tile => |done| if (std.meta.eql(done.tile, tile)) continue :next,
             .render_failed => |failed| if (std.meta.eql(failed, tile)) continue :next,
-            .opened, .open_failed => {},
+            .opened, .open_failed, .links => {},
         };
         renderer.wanted[renderer.wanted_len] = tile;
         renderer.wanted_len += 1;
@@ -170,10 +194,11 @@ pub fn idle(renderer: *Renderer) bool {
     renderer.mutex.lockUncancelable(renderer.io);
     defer renderer.mutex.unlock(renderer.io);
     return !renderer.reload_requested and !renderer.loading and
-        renderer.wanted_len == 0 and renderer.rendering == null and renderer.results.items.len == 0;
+        renderer.link_request == null and renderer.wanted_len == 0 and
+        renderer.rendering == null and renderer.results.items.len == 0;
 }
 
-/// Does one unit of work: a pending reload, else the most urgent tile.
+/// Handles a pending reload or link lookup before rendering the most urgent tile.
 /// Returns false if there was nothing to do.
 pub fn step(renderer: *Renderer) bool {
     renderer.mutex.lockUncancelable(renderer.io);
@@ -185,8 +210,10 @@ pub fn step(renderer: *Renderer) bool {
     };
     const reload_requested = renderer.reload_requested;
     renderer.reload_requested = false;
-    renderer.loading = reload_requested;
-    if (!reload_requested and renderer.wanted_len > 0) {
+    const link_request = if (reload_requested) null else renderer.link_request;
+    if (link_request != null) renderer.link_request = null;
+    renderer.loading = reload_requested or link_request != null;
+    if (!renderer.loading and renderer.wanted_len > 0) {
         renderer.rendering = renderer.wanted[0];
         std.mem.copyForwards(Tile, renderer.wanted[0 .. renderer.wanted_len - 1], renderer.wanted[1..renderer.wanted_len]);
         renderer.wanted_len -= 1;
@@ -196,6 +223,8 @@ pub fn step(renderer: *Renderer) bool {
 
     const result = if (reload_requested)
         renderer.load()
+    else if (link_request) |request|
+        renderer.readLinks(request)
     else if (tile) |t|
         renderer.render(t)
     else
@@ -219,7 +248,7 @@ pub fn step(renderer: *Renderer) bool {
 fn run(renderer: *Renderer) void {
     while (true) {
         renderer.mutex.lockUncancelable(renderer.io);
-        while (!renderer.stopping and !renderer.reload_requested and renderer.wanted_len == 0) {
+        while (!renderer.stopping and !renderer.reload_requested and renderer.link_request == null and renderer.wanted_len == 0) {
             renderer.condition.waitUncancelable(renderer.io, &renderer.mutex);
         }
         const stopping = renderer.stopping;
@@ -252,6 +281,35 @@ fn load(renderer: *Renderer) Result {
     renderer.doc = doc;
     renderer.generation += 1;
     return .{ .opened = .{ .generation = renderer.generation, .page_sizes = page_sizes, .page_offsets = page_offsets } };
+}
+
+fn readLinks(renderer: *Renderer, request: viewer.LinkRequest) ?Result {
+    if (request.generation != renderer.generation) return null;
+    const doc = &(renderer.doc orelse return null);
+    var arena: std.heap.ArenaAllocator = .init(renderer.gpa);
+    var results: std.ArrayList(document.Link) = .empty;
+    var incomplete = request.incomplete;
+    for (request.regions[0..request.len]) |region| {
+        if (renderer.link_id.load(.monotonic) != request.id) {
+            arena.deinit();
+            return null;
+        }
+        doc.appendLinks(region.page, region.area, arena.allocator(), &results, viewer.links_max) catch |err| {
+            incomplete = true;
+            if (err == error.OutOfMemory or err == error.FileTooBig) break;
+        };
+    }
+    std.mem.sort(document.Link, results.items, {}, struct {
+        fn lessThan(_: void, a: document.Link, b: document.Link) bool {
+            if (a.page != b.page) return a.page < b.page;
+            if (a.area.y0 != b.area.y0) return a.area.y0 < b.area.y0;
+            return a.area.x0 < b.area.x0;
+        }
+    }.lessThan);
+    return .{ .links = .{
+        .view = .{ .id = request.id, .links = results.items, .incomplete = incomplete },
+        .arena = arena,
+    } };
 }
 
 /// Renders and encodes `tile`, or returns null if it belongs to another
