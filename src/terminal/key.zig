@@ -24,6 +24,8 @@ pub const Key = union(enum) {
     end,
     page_up,
     page_down,
+    /// A key release is consumed without sending an action to the viewer.
+    release,
     /// A sequence ptz doesn't use, such as F-keys or a stray query reply.
     unknown,
 
@@ -85,6 +87,33 @@ pub const Key = union(enum) {
             if (bytes[end] >= 0x40 and bytes[end] <= 0x7e) break;
         } else return null;
         const params = bytes[2..end];
+        if (bytes[end] == 'u') {
+            var fields = std.mem.splitScalar(u8, params, ';');
+            var code_field = std.mem.splitScalar(u8, fields.first(), ':');
+            const code = std.fmt.parseInt(u8, code_field.first(), 10) catch 0;
+            var mod_field = std.mem.splitScalar(u8, fields.next() orelse "", ':');
+            const mod_text = mod_field.first();
+            const mods = if (mod_text.len == 0) 1 else std.fmt.parseInt(u8, mod_text, 10) catch 0;
+            const event = mod_field.next() orelse "1";
+            // CSI-u distinguishes Ctrl-I from Tab. Ignore releases and
+            // disregard lock keys when matching shortcuts.
+            const key: Key = blk: {
+                if (mods == 0 or mod_field.next() != null or fields.next() != null) break :blk .unknown;
+                if (std.mem.eql(u8, event, "3")) break :blk .release;
+                if (!(std.mem.eql(u8, event, "1") or std.mem.eql(u8, event, "2"))) break :blk .unknown;
+                const modifiers = (mods - 1) & 63;
+                if (modifiers == 4 and code >= 'a' and code <= 'z') break :blk .{ .ctrl = code };
+                if (modifiers != 0) break :blk .unknown;
+                break :blk switch (code) {
+                    9 => .tab,
+                    13 => .enter,
+                    27 => .escape,
+                    127 => .backspace,
+                    else => .unknown,
+                };
+            };
+            return .{ .key = key, .len = end + 1 };
+        }
         const first = std.fmt.parseInt(u8, params[0 .. std.mem.indexOfScalar(u8, params, ';') orelse params.len], 10) catch 0;
         return .{ .key = finalKey(bytes[end], first), .len = end + 1 };
     }
@@ -157,4 +186,8 @@ test "a sequence cut off at the end waits for the rest" {
     try std.testing.expectEqual(null, Key.decode("\xc3"));
     try std.testing.expectEqual(null, Key.decode("\x1b_Gi=31;OK\x1b"));
     try expectKeys("\x1b[1;5C", &.{.right});
+}
+
+test "CSI-u distinguishes the Ctrl-I press and release from legacy Tab" {
+    try expectKeys("\x1b[105;5u\x1b[105;5:3u\tj", &.{ .{ .ctrl = 'i' }, .release, .tab, .{ .char = 'j' } });
 }

@@ -168,6 +168,10 @@ pub const Placement = struct {
     /// Pixel offset of the top left corner within that cell.
     x_offset: u16,
     y_offset: u16,
+    behind_text: bool = false,
+    placement: u32 = 1,
+    /// Overlay order relative to ordinary image tiles.
+    layer: u2 = 0,
 };
 
 // ====================================================================================================

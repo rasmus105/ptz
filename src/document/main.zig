@@ -62,6 +62,45 @@ pub const View = struct {
     y: u32,
 };
 
+/// A rectangle in fractions of the rendered page, measured from top left.
+pub const Rect = extern struct {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+};
+
+/// Each match starts with `first` and can span several line fragments.
+pub const MatchPart = extern struct {
+    area: Rect,
+    first: bool,
+};
+
+pub const PageMatches = struct {
+    parts: []MatchPart,
+    truncated: bool,
+};
+
+pub const Destination = struct {
+    page: u32,
+    /// Fractions of the page, measured from top left. Either axis can be omitted.
+    x: ?f32,
+    y: ?f32,
+};
+
+pub const Link = struct {
+    page: u32,
+    area: Rect,
+    target: Target,
+
+    pub const Target = union(enum) { position: Destination, url: Web };
+    pub const Web = struct {
+        uri: []const u8,
+        /// End of the scheme and authority within `uri`.
+        authority_end: usize,
+    };
+};
+
 pub const Document = struct {
     gpa: std.mem.Allocator,
     bytes: []const u8,
@@ -100,6 +139,18 @@ pub const Document = struct {
 
     pub fn pageSize(doc: *const Document, page: u32) Error!Size {
         return doc.backend.pageSize(page);
+    }
+
+    /// Appends followable links intersecting `region`, clipping their areas
+    /// to it. The caller owns the appended entries and any URL text. Returns
+    /// FileTooBig if more links would take the list beyond `limit`.
+    pub fn appendLinks(doc: *const Document, page: u32, region: Rect, gpa: std.mem.Allocator, links: *std.ArrayList(Link), limit: usize) Error!void {
+        try doc.backend.appendLinks(page, region, gpa, links, limit);
+    }
+
+    /// Fills the buffer in reading order, retaining only complete occurrences.
+    pub fn searchPage(doc: *const Document, page: u32, query: [:0]const u8, parts: []MatchPart) Error!PageMatches {
+        return doc.backend.searchPage(page, query, parts);
     }
 
     /// Renders the selected region on white; pixels outside the page stay white.
@@ -306,4 +357,61 @@ test "unrepresentable render sizes fail without invalidating the document" {
     }, target));
     try doc.render(0, .{ .page_width = 1, .page_height = 1, .x = 0, .y = 0 }, target);
     try std.testing.expectEqual([4]u8{ 255, 0, 0, 255 }, pixels);
+}
+
+test "EPUB search groups wrapped lines and survives a full result buffer" {
+    var doc = try Document.open(std.testing.io, std.testing.allocator, "src/document/testdata/flow.epub");
+    defer doc.close();
+    const query = "The quick brown fox jumps over the lazy dog. This book contains flowing text that needs stable pagination when the terminal changes size.";
+    try std.testing.expect((try doc.searchPage(0, query, &.{})).truncated);
+    var buffer: [256]MatchPart = undefined;
+    const matches = try doc.searchPage(0, query, &buffer);
+    try std.testing.expect(!matches.truncated);
+    const parts = matches.parts;
+    try std.testing.expect(parts.len >= 2 and parts[0].first);
+    var continuation = false;
+    for (parts) |part| {
+        continuation = continuation or !part.first;
+        try std.testing.expect(0 <= part.area.x0 and part.area.x0 < part.area.x1 and part.area.x1 <= 1);
+        try std.testing.expect(0 <= part.area.y0 and part.area.y0 < part.area.y1 and part.area.y1 <= 1);
+    }
+    try std.testing.expect(continuation);
+    // Cut one fragment from the last hit. Its earlier fragments must also
+    // be withheld, leaving every preceding hit available for navigation.
+    var last = parts.len - 1;
+    while (!parts[last].first) last -= 1;
+    try std.testing.expect(last > 0 and last < parts.len - 1);
+    var small: [256]MatchPart = undefined;
+    const prefix = try doc.searchPage(0, query, small[0 .. parts.len - 1]);
+    try std.testing.expect(prefix.truncated);
+    try std.testing.expectEqualSlices(MatchPart, parts[0..last], prefix.parts);
+    try std.testing.expectEqual(0, (try doc.searchPage(0, "absent phrase", &buffer)).parts.len);
+}
+
+test "search includes annotation appearances before and after rendering" {
+    const gpa = std.testing.allocator;
+    var area: Rect = undefined;
+    for ([_]bool{ false, true }) |render_first| {
+        var doc = try Document.open(std.testing.io, gpa, "src/document/testdata/search-annotation.pdf");
+        defer doc.close();
+        if (render_first) {
+            var samples: [4]u8 = undefined;
+            try doc.render(0, .{ .page_width = 1, .page_height = 1, .x = 0, .y = 0 }, .{ .width = 1, .height = 1, .pixels = &samples });
+        }
+        var parts: [1]MatchPart = undefined;
+        const result = try doc.searchPage(0, "Annotated", &parts);
+        try std.testing.expect(!result.truncated and result.parts.len == 1);
+        if (render_first) try std.testing.expectEqual(area, parts[0].area) else area = parts[0].area;
+    }
+}
+
+test "a later short hit cannot fill the space left by a truncated wrapped hit" {
+    var doc = try Document.open(std.testing.io, std.testing.allocator, "src/document/testdata/search-annotation.pdf");
+    defer doc.close();
+    var parts: [3]MatchPart = undefined;
+    const full = try doc.searchPage(0, "two words", &parts);
+    try std.testing.expect(!full.truncated and full.parts.len == 3);
+    try std.testing.expect(parts[0].first and !parts[1].first and parts[2].first);
+    const prefix = try doc.searchPage(0, "two words", parts[0..1]);
+    try std.testing.expect(prefix.truncated and prefix.parts.len == 0);
 }

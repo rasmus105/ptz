@@ -62,6 +62,8 @@ transfer_budget_bytes: u64,
 next_id: graphics.ImageId,
 /// Budgets; the constants above except in tests.
 uploaded_budget_bytes: u64,
+/// Terminal memory occupied by the search palette.
+reserved_bytes: u64 = 0,
 pending_budget_bytes: u64,
 uploaded_bytes: u64,
 pending_bytes: u64,
@@ -149,6 +151,12 @@ pub fn needsFrame(cache: *const Cache, tile: Tile) bool {
     return false;
 }
 
+pub fn reserve(cache: *Cache, writer: *std.Io.Writer, amount: u64) std.Io.Writer.Error!void {
+    if (amount > cache.reserved_bytes)
+        try cache.deleteUploaded(writer, cache.uploaded_budget_bytes -| amount);
+    cache.reserved_bytes = amount;
+}
+
 /// Forgets only the failed id. A delayed reply cannot discard a replacement
 /// upload, which receives a fresh id through `put`.
 pub fn reject(cache: *Cache, reply: graphics.Reply) enum { ignored, retry, failed } {
@@ -233,7 +241,7 @@ pub fn upload(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer, til
         // Make room first: a terminal over its quota deletes images on its
         // own, starting with those not on screen, which ptz would then
         // place as if they were still there.
-        try cache.deleteUploaded(writer, cache.uploaded_budget_bytes -| bytes(tile));
+        try cache.deleteUploaded(writer, cache.uploaded_budget_bytes -| cache.reserved_bytes -| bytes(tile));
         const entry = cache.entries.getPtr(tile).?;
         entry.state = .failed;
         cache.pending_bytes -= bytes(tile);
@@ -286,7 +294,7 @@ pub fn evict(cache: *Cache, gpa: std.mem.Allocator, writer: *std.Io.Writer) std.
         cache.pending_bytes -= bytes(cache.entries.keys()[evicted]);
         cache.entries.swapRemoveAt(evicted);
     }
-    try cache.deleteUploaded(writer, cache.uploaded_budget_bytes);
+    try cache.deleteUploaded(writer, cache.uploaded_budget_bytes -| cache.reserved_bytes);
     cache.clock += 1;
 }
 

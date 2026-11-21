@@ -175,7 +175,7 @@ test "fragmented missing-image replies never become keys and preserve neighborin
         try std.testing.expectEqual(reference.state.anchor, instance.state.anchor);
         try std.testing.expectEqual(reference.state.dark, instance.state.dark);
         try std.testing.expectEqual(reference.state.zoom, instance.state.zoom);
-        try std.testing.expectEqual(reference.state.command_open, instance.state.command_open);
+        try std.testing.expectEqual(reference.state.prompt, instance.state.prompt);
         try std.testing.expectEqual(null, instance.cache.shown(small_tile));
         try std.testing.expect(instance.input("q"));
     }
@@ -208,7 +208,7 @@ test "oversized control strings discard command-like tails through split termina
             try std.testing.expectEqual(reference.state.anchor, instance.state.anchor);
             try std.testing.expectEqual(reference.state.dark, instance.state.dark);
             try std.testing.expectEqual(reference.state.zoom, instance.state.zoom);
-            try std.testing.expectEqual(reference.state.command_open, instance.state.command_open);
+            try std.testing.expectEqual(reference.state.prompt, instance.state.prompt);
             try std.testing.expect(instance.input("q"));
         }
     }

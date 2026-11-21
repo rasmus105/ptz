@@ -110,15 +110,42 @@ pub const Emulator = struct {
     }
 
     pub fn screenshot(emulator: *Emulator, gpa: std.mem.Allocator) !Screenshot {
+        return emulator.screenshotExcluding(gpa, &.{});
+    }
+
+    /// Omit overlay images when checking coverage of the underlying document.
+    pub fn screenshotExcluding(emulator: *Emulator, gpa: std.mem.Allocator, excluded: []const u32) !Screenshot {
         const size = emulator.size;
         const width = @as(u32, size.cols) * size.cell_width;
         const height = @as(u32, size.rows) * size.cell_height;
         const pixels = try gpa.alloc(u8, @as(usize, width) * height * 4);
+        errdefer gpa.free(pixels);
         @memset(pixels, 0);
 
+        // A disjoint tile row can be copied directly even if its pixels have
+        // alpha. Keep alpha blending proportional to overlapping image area.
+        const Span = struct { left: u32, right: u32 };
+        const painted = try gpa.alloc(Span, height);
+        defer gpa.free(painted);
+        @memset(painted, .{ .left = width, .right = 0 });
+
         const screen = emulator.terminal.screens.active;
+        const Entry = @TypeOf(screen.kitty_images.placements).Entry;
+        var ordered: std.ArrayList(Entry) = .empty;
+        defer ordered.deinit(gpa);
         var placements = screen.kitty_images.placements.iterator();
         while (placements.next()) |entry| {
+            if (std.mem.findScalar(u32, excluded, entry.key_ptr.image_id) == null)
+                try ordered.append(gpa, entry);
+        }
+        const Order = struct {
+            fn lessThan(_: void, a: Entry, b: Entry) bool {
+                if (a.value_ptr.z != b.value_ptr.z) return a.value_ptr.z < b.value_ptr.z;
+                return a.key_ptr.image_id < b.key_ptr.image_id;
+            }
+        };
+        std.mem.sort(Entry, ordered.items, {}, Order.lessThan);
+        for (ordered.items) |entry| {
             const placement = entry.value_ptr;
             const pin = switch (placement.location) {
                 .pin => |pin| pin,
@@ -139,9 +166,32 @@ pub const Emulator = struct {
             const left = point.active.x * size.cell_width + placement.x_offset;
             const top = point.active.y * size.cell_height + placement.y_offset;
             const columns = @min(source_width, width -| left);
+            if (columns == 0) continue;
             for (0..@min(source_height, height -| top)) |row| {
                 const source = data[((placement.source_y + row) * image.width + placement.source_x) * 4 ..][0 .. columns * 4];
-                @memcpy(pixels[((top + row) * width + left) * 4 ..][0 .. columns * 4], source);
+                const destination = pixels[((top + row) * width + left) * 4 ..][0 .. columns * 4];
+                const span = &painted[top + row];
+                const disjoint = left >= span.right or left + columns <= span.left;
+                span.left = @min(span.left, left);
+                span.right = @max(span.right, left + columns);
+                if (disjoint) {
+                    @memcpy(destination, source);
+                    continue;
+                }
+                for (std.mem.bytesAsSlice([4]u8, source), std.mem.bytesAsSlice([4]u8, destination)) |src, *dst| {
+                    const alpha: u32 = src[3];
+                    if (alpha == 0) continue;
+                    if (alpha == 255 or dst[3] == 0) {
+                        dst.* = src;
+                        continue;
+                    }
+                    const dest_alpha: u32 = dst[3];
+                    const combined = alpha * 255 + dest_alpha * (255 - alpha);
+                    for (0..3) |channel| {
+                        dst[channel] = @intCast((@as(u32, src[channel]) * alpha * 255 + @as(u32, dst[channel]) * dest_alpha * (255 - alpha) + combined / 2) / combined);
+                    }
+                    dst[3] = @intCast((combined + 127) / 255);
+                }
             }
         }
         return .{ .width = width, .height = height, .pixels = pixels };
@@ -181,3 +231,24 @@ pub const Emulator = struct {
         return .{};
     }
 };
+
+// ====================================================================================================
+// Tests
+// ====================================================================================================
+
+test "a highlight alone leaves a hole in document coverage" {
+    const gpa = std.testing.allocator;
+    const emulator = try Emulator.create(std.testing.io, gpa, .{ .cols = 2, .rows = 1, .cell_width = 1, .cell_height = 1 });
+    defer emulator.destroy();
+    // An opaque white document pixel, then a yellow highlight across both cells.
+    try emulator.output.writeAll("\x1b_Ga=T,f=32,i=1,s=1,v=1,C=1;/////w==\x1b\\");
+    try emulator.output.writeAll("\x1b_Ga=T,f=32,i=2,s=2,v=1,C=1,z=1;//8AMP//ADA=\x1b\\");
+    try emulator.output.flush();
+    const composite = try emulator.screenshot(gpa);
+    defer gpa.free(composite.pixels);
+    try std.testing.expect(composite.pixel(1, 0)[3] > 0);
+    const document = try emulator.screenshotExcluding(gpa, &.{2});
+    defer gpa.free(document.pixels);
+    try std.testing.expectEqual(255, document.pixel(0, 0)[3]);
+    try std.testing.expectEqual(0, document.pixel(1, 0)[3]);
+}

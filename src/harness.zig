@@ -270,7 +270,7 @@ fn threaded(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *ap
             try viewer.draw(&emulator.output);
             const drawn: std.Io.Timestamp = .now(io, .awake);
             draw_max_ms = @max(draw_max_ms, draw_started.durationTo(drawn).toMilliseconds());
-            const screen = try emulator.screenshot(gpa);
+            const screen = try emulator.screenshotExcluding(gpa, &viewer.highlights.images);
             defer gpa.free(screen.pixels);
             uncovered = uncoveredPixels(viewer, screen);
             frames += 1;
@@ -397,6 +397,7 @@ fn fuzz(io: std.Io, gpa: std.mem.Allocator, app_options: app.Options, start_size
                 const bytes, const len = try keyBytes(rest, &bytes_buffer);
                 rest = rest[len..];
                 std.debug.assert(!viewer.input(bytes));
+                if (viewer.escape_started) |since| viewer.expireInput(since.addDuration(.fromSeconds(1)));
             }
         }
         // A busy render thread finishes a few results at most between keys.
@@ -443,7 +444,13 @@ fn fuzzCheck(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *a
     if (terminal_warnings > 0) return error.TerminalRejectedCommands;
 
     const state = &viewer.state;
-    const uncovered = uncoveredPixels(viewer, screen);
+    const uncovered = if (std.mem.allEqual(u32, &viewer.highlights.images, 0))
+        uncoveredPixels(viewer, screen)
+    else blk: {
+        const document_screen = try emulator.screenshotExcluding(gpa, &viewer.highlights.images);
+        defer gpa.free(document_screen.pixels);
+        break :blk uncoveredPixels(viewer, document_screen);
+    };
     if (uncovered > 0) {
         std.debug.print("{d} page pixels not covered by any image\n", .{uncovered});
         return error.Uncovered;
@@ -459,6 +466,7 @@ fn fuzzCheck(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *a
     const document = fresh.state.document;
     fresh.state = state.*;
     fresh.state.document = document;
+    if (fresh.state.search_query) |*query| query.generation = document.generation;
     // Recomputes the geometry for the fresh document.
     fresh.resize(state.size);
     try settle(io, fresh, fresh_emulator, 5000);

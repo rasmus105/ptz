@@ -1,0 +1,37 @@
+%PDF-1.5
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Count 1 /Kids [3 0 R] >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R /Annots [6 0 R] >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 73 >>
+stream
+BT /F1 12 Tf 40 250 Td 14 TL (two) Tj T* (words) Tj T* (two words) Tj ET
+endstream
+endobj
+6 0 obj
+<< /Type /Annot /Subtype /FreeText /Rect [40 60 200 90] /Contents (Annotated) /DA (/F1 12 Tf) /AP << /N 7 0 R >> >>
+endobj
+7 0 obj
+<< /Type /XObject /Subtype /Form /BBox [0 0 160 30] /Resources << /Font << /F1 4 0 R >> >> /Length 39 >>
+stream
+BT /F1 12 Tf 0 10 Td (Annotated) Tj ET
+endstream
+endobj
+8 0 obj
+<< /Type /XRef /Root 1 0 R /Size 9 /W [1 4 2] /Filter /ASCIIHexDecode /Length 127 >>
+stream
+0000000000FFFF01000000090000010000003A000001000000730000010000010100000100000147000001000001C100000100000244000001000002F40000>
+endstream
+endobj
+startxref
+756
+%%EOF

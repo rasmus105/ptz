@@ -120,12 +120,6 @@ pub const Version = struct {
     dark: bool,
 };
 
-/// Where the content's top left corner is relative to the view.
-const Origin = struct {
-    left: i64,
-    top: i64,
-};
-
 /// The document's layout at one zoom and window size.
 pub const Geometry = struct {
     page_sizes: []const document.Size,
@@ -181,6 +175,15 @@ pub const Geometry = struct {
         return @max(1, @as(u32, @intFromFloat(@round(geometry.page_sizes[page].height * geometry.scale))));
     }
 
+    /// Horizontal position of a page within the view, in pixels.
+    pub fn pageLeft(geometry: Geometry, page: u32, pan_x: u32) i64 {
+        const content_left = if (geometry.content_width <= geometry.view_width)
+            @divFloor(@as(i64, geometry.view_width) - geometry.content_width, 2)
+        else
+            -@as(i64, pan_x);
+        return content_left + @divFloor(@as(i64, geometry.content_width) - geometry.pageWidth(page), 2);
+    }
+
     /// Distance of the page's top from the document's top, in pixels.
     pub fn pageTop(geometry: Geometry, page: u32) i64 {
         const offset = geometry.page_offsets[page] * geometry.scale;
@@ -233,18 +236,12 @@ pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, 
 
     const top = geometry.offsetOf(anchor);
     const height: i64 = geometry.view_height;
-    // Content narrower than the view is centred; wider content is panned.
-    const left: i64 = if (geometry.content_width <= geometry.view_width)
-        @divFloor(@as(i64, geometry.view_width) - geometry.content_width, 2)
-    else
-        -@as(i64, pan_x);
-    const origin: Origin = .{ .left = left, .top = top };
     // Visible tiles first, so they also lead the wanted list.
-    addTiles(geometry, version, origin, top, top + height, tiles, true);
+    addTiles(geometry, version, pan_x, top, top, top + height, tiles, true);
     switch (prefetch) {
         .none => {},
-        .below => addTiles(geometry, version, origin, top + height, top + 2 * height, tiles, false),
-        .above => addTiles(geometry, version, origin, top - height, top, tiles, false),
+        .below => addTiles(geometry, version, pan_x, top, top + height, top + 2 * height, tiles, false),
+        .above => addTiles(geometry, version, pan_x, top, top - height, top, tiles, false),
     }
 }
 
@@ -255,14 +252,14 @@ pub fn layout(geometry: Geometry, anchor: Anchor, pan_x: u32, version: Version, 
 /// Adds the tiles overlapping document rows [`start`, `end`) and the view's
 /// columns to the wanted list, and with `visible` their visible parts to the
 /// slices. Tiles beyond the capacity are dropped.
-fn addTiles(geometry: Geometry, version: Version, origin: Origin, start: i64, end: i64, tiles: *Tiles, visible: bool) void {
+fn addTiles(geometry: Geometry, version: Version, pan_x: u32, view_top: i64, start: i64, end: i64, tiles: *Tiles, visible: bool) void {
     var page = geometry.pageAt(start);
     while (page < geometry.page_sizes.len) : (page += 1) {
         const page_top = geometry.pageTop(page);
         if (page_top >= end) break;
         const page_width = geometry.pageWidth(page);
         const page_height = geometry.pageHeight(page);
-        const page_left = origin.left + @divFloor(@as(i64, geometry.content_width) - page_width, 2);
+        const page_left = geometry.pageLeft(page, pan_x);
 
         // The page's pixels within the range and the view, if any.
         const x_start = @max(0, -page_left);
@@ -285,7 +282,7 @@ fn addTiles(geometry: Geometry, version: Version, origin: Origin, start: i64, en
                     .dark = version.dark,
                 };
                 if (!addWanted(tiles, tile)) return;
-                if (visible) addSlice(geometry, tile, page_left, page_top, origin.top, tiles);
+                if (visible) addSlice(geometry, tile, page_left, page_top, view_top, tiles);
             }
         }
     }
