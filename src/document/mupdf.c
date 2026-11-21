@@ -1,5 +1,6 @@
 #include "mupdf.h"
 #include "mupdf/fitz.h"
+#include "mupdf/pdf.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -39,6 +40,13 @@ typedef struct {
     fz_display_list *list;
 } LoadedPage;
 
+typedef struct {
+    int number;
+    uint64_t last_used;
+    fz_rect bounds;
+    fz_stext_page *text;
+} TextPage;
+
 /* MuPDF retains the allocator's user pointer, so this object stays in C-owned
  * storage even when its Zig owner moves between the render thread and UI. */
 struct ptz_document {
@@ -55,6 +63,8 @@ struct ptz_document {
     int page_count;
     uint64_t clock;
     LoadedPage pages[LOADED_PAGES_MAX];
+    TextPage texts[LOADED_PAGES_MAX];
+    bool maybe_raster, raster;
 };
 
 static void *document_malloc(void *user, size_t size)
@@ -208,6 +218,8 @@ static void validate_image(fz_context *ctx, fz_device *device, fz_image *image,
 static void drop_pages(ptz_document *doc)
 {
     for (int i = 0; i < LOADED_PAGES_MAX; i++) {
+        fz_drop_stext_page(doc->ctx, doc->texts[i].text);
+        doc->texts[i] = (TextPage){0};
         fz_drop_display_list(doc->ctx, doc->pages[i].list);
         fz_drop_page(doc->ctx, doc->pages[i].page);
         doc->pages[i] = (LoadedPage){0};
@@ -334,6 +346,7 @@ ptz_status ptz_mupdf_open(const unsigned char *bytes, size_t length, size_t budg
             /* Native image documents defer validation until a page is loaded.
              * Validate before a reload is allowed to replace a good snapshot. */
             if (raster) {
+                doc->maybe_raster = true;
                 validator = fz_new_device_of_size(ctx, sizeof(fz_device));
                 validator->fill_image = validate_image;
                 for (int page = 0; page < doc->page_count; page++) {
@@ -391,6 +404,240 @@ ptz_status ptz_mupdf_page_size(ptz_document *doc, uint32_t page, float *width, f
             return status;
         drop_pages(doc);
         fz_empty_store(doc->ctx);
+    }
+}
+
+ptz_status ptz_mupdf_links(ptz_document *doc, uint32_t page, const ptz_rect *region,
+                           ptz_link_callback callback, void *user)
+{
+    if (page >= (uint32_t)doc->page_count) return PTZ_PAGE_NOT_FOUND;
+    fz_context *ctx = doc->ctx;
+    fz_link *links = NULL;
+    ptz_status status = PTZ_OK;
+    doc->exhausted = 0;
+    fz_var(links);
+    fz_try(ctx) {
+        LoadedPage *loaded = load_page(doc, (int)page);
+        fz_rect bounds = loaded->bounds;
+        float width = bounds.x1 - bounds.x0;
+        float height = bounds.y1 - bounds.y0;
+        if (!(width > 0) || !(height > 0) || !isfinite(width) || !isfinite(height))
+            fz_throw(ctx, FZ_ERROR_FORMAT, "invalid link bounds");
+        links = fz_load_links(ctx, loaded->page);
+        pdf_document *pdf = pdf_specifics(ctx, doc->handle);
+        for (fz_link *link = links; link; link = link->next) {
+            fz_rect rect = link->rect;
+            if (!link->uri || !link->uri[0] ||
+                !isfinite(rect.x0) || !isfinite(rect.x1) ||
+                !isfinite(rect.y0) || !isfinite(rect.y1))
+                continue;
+            ptz_link entry = {
+                .area = {
+                    fmaxf(region->x0, (rect.x0 - bounds.x0) / width),
+                    fmaxf(region->y0, (rect.y0 - bounds.y0) / height),
+                    fminf(region->x1, (rect.x1 - bounds.x0) / width),
+                    fminf(region->y1, (rect.y1 - bounds.y0) / height),
+                },
+                .uri = link->uri,
+                .page = -1,
+                .x = NAN,
+                .y = NAN,
+            };
+            if (entry.area.x0 >= entry.area.x1 || entry.area.y0 >= entry.area.y1)
+                continue;
+            if (!fz_is_external_link(ctx, link->uri)) {
+                int target = -1;
+                fz_var(target);
+                fz_try(ctx) {
+                    fz_link_dest dest = fz_resolve_link_dest(ctx, doc->handle, link->uri);
+                    if (dest.loc.page >= 0 && dest.loc.chapter >= 0 &&
+                        dest.loc.chapter < fz_count_chapters(ctx, doc->handle) &&
+                        dest.loc.page < fz_count_chapter_pages(ctx, doc->handle, dest.loc.chapter)) {
+                        target = fz_page_number_from_location(ctx, doc->handle, dest.loc);
+                        if (target >= 0 && target < doc->page_count &&
+                            (isfinite(dest.x) || isfinite(dest.y))) {
+                            fz_rect target_bounds;
+                            if (target == (int)page) {
+                                target_bounds = bounds;
+                            } else if (pdf) {
+                                // A table of contents can target hundreds of pages.
+                                // Get their geometry without loading their annotations.
+                                fz_matrix matrix;
+                                pdf_obj *obj = pdf_lookup_page_obj(ctx, pdf, target);
+                                pdf_page_obj_transform_box(ctx, obj, &target_bounds, &matrix, FZ_CROP_BOX);
+                                target_bounds = fz_transform_rect(target_bounds, matrix);
+                            } else {
+                                target_bounds = load_page(doc, target)->bounds;
+                            }
+                            float w = target_bounds.x1 - target_bounds.x0;
+                            float h = target_bounds.y1 - target_bounds.y0;
+                            if (w > 0 && isfinite(w)) entry.x = (dest.x - target_bounds.x0) / w;
+                            if (h > 0 && isfinite(h)) entry.y = (dest.y - target_bounds.y0) / h;
+                        }
+                    }
+                }
+                fz_catch(ctx) {
+                    if (fz_caught(ctx) == FZ_ERROR_SYSTEM || fz_caught(ctx) == FZ_ERROR_LIMIT)
+                        fz_rethrow(ctx);
+                    continue;
+                }
+                if (target < 0 || target >= doc->page_count) continue;
+                entry.page = target;
+                entry.uri = NULL;
+            }
+            if (callback(user, &entry)) break;
+        }
+    }
+    fz_always(ctx) {
+        fz_drop_link(ctx, links);
+    }
+    fz_catch(ctx) {
+        status = caught_error(doc);
+    }
+    return status;
+}
+
+/* Keep the scan independent of the render LRU: searching a distant page
+ * should not push the viewport's expensive display lists out of the cache. */
+static TextPage *load_text(ptz_document *doc, int number)
+{
+    fz_context *ctx = doc->ctx;
+    doc->clock++;
+    TextPage *oldest = &doc->texts[0];
+    LoadedPage *rendered = NULL;
+    for (int i = 0; i < LOADED_PAGES_MAX; i++) {
+        TextPage *entry = &doc->texts[i];
+        if (entry->text && entry->number == number) {
+            entry->last_used = doc->clock;
+            return entry;
+        }
+        if (entry->last_used < oldest->last_used) oldest = entry;
+        if (doc->pages[i].page && doc->pages[i].number == number)
+            rendered = &doc->pages[i];
+    }
+    fz_drop_stext_page(ctx, oldest->text);
+    *oldest = (TextPage){0};
+    fz_page *temporary = NULL;
+    uint64_t errors = doc->errors;
+    fz_device *device = NULL;
+    fz_var(temporary);
+    fz_var(device);
+    fz_try(ctx) {
+        fz_stext_options options = { .flags = FZ_STEXT_DEHYPHENATE };
+        fz_cookie cookie = {0};
+        if (!rendered) temporary = fz_load_page(ctx, doc->handle, number);
+        oldest->bounds = rendered ? rendered->bounds : fz_bound_page(ctx, temporary);
+        if (rendered && rendered->list) {
+            oldest->text = fz_new_stext_page_from_display_list(ctx, rendered->list, &options);
+        } else {
+            /* Match the render list, including visible annotations and widgets. */
+            oldest->text = fz_new_stext_page(ctx, oldest->bounds);
+            device = fz_new_stext_device(ctx, oldest->text, &options);
+            fz_run_page(ctx, rendered ? rendered->page : temporary, device, fz_identity, &cookie);
+            fz_close_device(ctx, device);
+        }
+        if (cookie.errors || cookie.incomplete || doc->errors != errors)
+            fz_throw(ctx, FZ_ERROR_FORMAT, "cannot extract page text completely");
+    }
+    fz_always(ctx) {
+        fz_drop_device(ctx, device);
+        fz_drop_page(ctx, temporary);
+    }
+    fz_catch(ctx) {
+        fz_drop_stext_page(ctx, oldest->text);
+        *oldest = (TextPage){0};
+        fz_rethrow(ctx);
+    }
+    oldest->number = number;
+    oldest->last_used = doc->clock;
+    return oldest;
+}
+
+/* The callback search API in MuPDF 1.28.6 ignores early termination.
+ * Iterate directly to stop as soon as a whole occurrence will not fit. */
+static bool search_text(fz_context *ctx, TextPage *page, const char *query,
+                        ptz_match_part *parts, size_t capacity, size_t *count)
+{
+    fz_rect bounds = page->bounds;
+    float w = bounds.x1 - bounds.x0, h = bounds.y1 - bounds.y0;
+    if (!isfinite(w) || !isfinite(h) || !(w > 0 && h > 0))
+        fz_throw(ctx, FZ_ERROR_FORMAT, "invalid search bounds");
+    fz_search *search = fz_new_search(ctx, query, FZ_SEARCH_IGNORE_CASE);
+    bool full = false;
+    *count = 0;
+    fz_try(ctx) {
+        fz_feed_search(ctx, search, fz_keep_stext_page(ctx, page->text), 0);
+        while (!full) {
+            fz_search_result result = fz_search_forwards(ctx, search);
+            if (result.reason == FZ_SEARCH_COMPLETE) break;
+            if (result.reason == FZ_SEARCH_MORE_INPUT) {
+                fz_feed_search(ctx, search, NULL, result.u.seq_needed);
+                continue;
+            }
+            fz_search_match *match = result.u.match;
+            size_t start = *count;
+            for (int i = 0; i < match->num_quads; i++) {
+                fz_rect r = fz_intersect_rect(fz_rect_from_quad(match->quads[i].quad), bounds);
+                if (!(r.x0 < r.x1 && r.y0 < r.y1)) continue;
+                if (*count == capacity) {
+                    *count = start;
+                    full = true;
+                    break;
+                }
+                parts[*count] = (ptz_match_part){
+                    {(r.x0 - bounds.x0) / w, (r.y0 - bounds.y0) / h,
+                     (r.x1 - bounds.x0) / w, (r.y1 - bounds.y0) / h},
+                    *count == start
+                };
+                (*count)++;
+            }
+        }
+    }
+    fz_always(ctx) {
+        fz_drop_search(ctx, search);
+    }
+    fz_catch(ctx) {
+        fz_rethrow(ctx);
+    }
+    return full;
+}
+
+ptz_status ptz_mupdf_search(ptz_document *doc, uint32_t page, const char *query,
+                            ptz_match_part *parts, size_t capacity, size_t *count, bool *truncated)
+{
+    if (page >= (uint32_t)doc->page_count) return PTZ_PAGE_NOT_FOUND;
+    fz_context *ctx = doc->ctx;
+    for (int attempt = 0; ; attempt++) {
+        doc->exhausted = 0;
+        uint64_t errors = doc->errors;
+        ptz_status status = PTZ_OK;
+        fz_try(ctx) {
+            if (doc->maybe_raster) {
+                /* A recognizable image prefix alone need not identify the
+                 * selected handler. Confirm it once, on the first search. */
+                char format[16];
+                if (fz_lookup_metadata(ctx, doc->handle, FZ_META_FORMAT, format, sizeof(format)) > 0)
+                    doc->raster = !strcmp(format, "Image") || !strcmp(format, "PNM") ||
+                        !strcmp(format, "TIFF") || !strcmp(format, "BMP") || !strcmp(format, "JBIG2");
+                doc->maybe_raster = false;
+            }
+            if (doc->raster) {
+                *count = 0;
+                *truncated = false;
+            } else {
+                TextPage *loaded = load_text(doc, (int)page);
+                *truncated = search_text(ctx, loaded, query, parts, capacity, count);
+            }
+        }
+        fz_catch(ctx) {
+            status = caught_error(doc);
+        }
+        if (doc->errors != errors && (status == PTZ_OK || status == PTZ_INVALID_FORMAT))
+            status = doc->reported_status;
+        if (attempt || (status != PTZ_FILE_TOO_BIG && status != PTZ_OUT_OF_MEMORY))
+            return status;
+        drop_pages(doc);
+        fz_empty_store(ctx);
     }
 }
 

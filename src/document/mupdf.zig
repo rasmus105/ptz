@@ -13,6 +13,67 @@ const document = @import("main.zig");
 
 const Handle = opaque {};
 
+const Link = extern struct {
+    area: document.Rect,
+    uri: ?[*:0]const u8,
+    page: i32,
+    x: f32,
+    y: f32,
+};
+
+const LinkCollector = struct {
+    page: u32,
+    gpa: std.mem.Allocator,
+    links: *std.ArrayList(document.Link),
+    limit: usize,
+    failure: ?document.Error = null,
+
+    fn append(context: *anyopaque, entry: *const Link) callconv(.c) c_int {
+        const collector: *LinkCollector = @ptrCast(@alignCast(context));
+        const gpa = collector.gpa;
+        var target: document.Link.Target = if (entry.uri) |uri| blk: {
+            const text = std.mem.span(uri);
+            if (text.len > 4096) return 0;
+            // Only hand web URLs to the OS opener. An unambiguous authority
+            // and printable ASCII also keep the confirmation honest.
+            for (text) |byte| {
+                if (byte < 0x21 or byte > 0x7e or byte == '\\') return 0;
+            }
+            const parsed = std.Uri.parse(text) catch return 0;
+            if ((!std.ascii.eqlIgnoreCase(parsed.scheme, "http") and
+                !std.ascii.eqlIgnoreCase(parsed.scheme, "https")) or
+                parsed.host == null or parsed.host.?.percent_encoded.len == 0 or
+                std.mem.findScalar(u8, parsed.host.?.percent_encoded, '%') != null or
+                parsed.user != null or parsed.password != null)
+                return 0;
+            break :blk .{ .url = .{
+                .uri = text,
+                .authority_end = std.mem.findAnyPos(u8, text, parsed.scheme.len + 3, "/?#") orelse text.len,
+            } };
+        } else .{ .position = .{
+            .page = @intCast(entry.page),
+            .x = if (std.math.isFinite(entry.x)) entry.x else null,
+            .y = if (std.math.isFinite(entry.y)) entry.y else null,
+        } };
+        if (collector.links.items.len >= collector.limit) {
+            collector.failure = error.FileTooBig;
+            return 1;
+        }
+        if (target == .url) {
+            target.url.uri = gpa.dupe(u8, target.url.uri) catch {
+                collector.failure = error.OutOfMemory;
+                return 1;
+            };
+        }
+        collector.links.append(gpa, .{ .page = collector.page, .area = entry.area, .target = target }) catch {
+            if (target == .url) gpa.free(target.url.uri);
+            collector.failure = error.OutOfMemory;
+            return 1;
+        };
+        return 0;
+    }
+};
+
 /// Mirrors the private bridge's status codes in mupdf.h.
 const Status = enum(c_int) {
     ok,
@@ -71,6 +132,25 @@ pub const Document = struct {
         return .{ .width = clampSize(width * scale), .height = clampSize(height * scale) };
     }
 
+    pub fn appendLinks(doc: *const Document, page: u32, region: document.Rect, gpa: std.mem.Allocator, links: *std.ArrayList(document.Link), limit: usize) document.Error!void {
+        engine_lock.lockUncancelable(doc.io);
+        defer engine_lock.unlock(doc.io);
+        var collector: LinkCollector = .{ .page = page, .gpa = gpa, .links = links, .limit = limit };
+        try check(ptz_mupdf_links(doc.handle, page, &region, LinkCollector.append, &collector));
+        if (collector.failure) |err| return err;
+    }
+
+    pub fn searchPage(doc: *const Document, page: u32, query: [:0]const u8, parts: []document.MatchPart) document.Error!document.PageMatches {
+        if (page >= doc.page_count) return error.PageNotFound;
+        if (query.len == 0 or std.mem.findScalar(u8, query, 0) != null) return .{ .parts = parts[0..0], .truncated = false };
+        engine_lock.lockUncancelable(doc.io);
+        defer engine_lock.unlock(doc.io);
+        var count: usize = undefined;
+        var truncated: bool = undefined;
+        try check(ptz_mupdf_search(doc.handle, page, query.ptr, parts.ptr, parts.len, &count, &truncated));
+        return .{ .parts = parts[0..count], .truncated = truncated };
+    }
+
     pub fn render(doc: *Document, page: u32, view: document.View, target: document.Bitmap) document.Error!void {
         engine_lock.lockUncancelable(doc.io);
         defer engine_lock.unlock(doc.io);
@@ -102,6 +182,8 @@ fn check(status: Status) document.Error!void {
 extern fn ptz_mupdf_open(bytes: [*]const u8, length: usize, budget: usize, result: *?*Handle, page_count: *u32) Status;
 extern fn ptz_mupdf_close(doc: *Handle) void;
 extern fn ptz_mupdf_page_size(doc: *Handle, page: u32, width: *f32, height: *f32) Status;
+extern fn ptz_mupdf_links(doc: *Handle, page: u32, region: *const document.Rect, callback: *const fn (*anyopaque, *const Link) callconv(.c) c_int, context: *anyopaque) Status;
+extern fn ptz_mupdf_search(doc: *Handle, page: u32, query: [*:0]const u8, parts: [*]document.MatchPart, capacity: usize, count: *usize, truncated: *bool) Status;
 extern fn ptz_mupdf_render(doc: *Handle, page: u32, page_width: u32, page_height: u32, x: u32, y: u32, width: u32, height: u32, pixels: [*]u8) Status;
 
 // ====================================================================================================
