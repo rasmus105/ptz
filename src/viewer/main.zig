@@ -19,6 +19,7 @@ const terminal = @import("../terminal/main.zig");
 // local
 const keymap = @import("keymap.zig");
 const links = @import("links.zig");
+pub const search = @import("search.zig");
 const tiling = @import("tiling.zig");
 
 // ====================================================================================================
@@ -31,7 +32,7 @@ const zoom_min = 0.25;
 const zoom_max = 8;
 /// Rows scrolled by `j` and `k`.
 const line_rows = 2;
-const command_len_max = 128;
+const command_len_max = search.query_max;
 const message_len_max = 160;
 const status_len_max = 512;
 
@@ -74,6 +75,7 @@ pub const Event = union(enum) {
     /// `document` event. The position is kept, clamped to the document.
     document: Document,
     links: LinkResult,
+    search_result: search.Navigation,
     /// Something to tell the user, e.g. that a reload failed.
     message: []const u8,
 };
@@ -85,6 +87,8 @@ pub const Effect = union(enum) {
     reload,
     find_links,
     cancel_links,
+    find_text,
+    cancel_search,
     open_url: []const u8,
 };
 
@@ -142,13 +146,21 @@ pub const State = struct {
     zoom: f32,
     dark: bool,
     keymap: keymap.KeyMap,
-    command_open: bool = false,
+    prompt: enum { none, command, search } = .none,
     command_buffer: [command_len_max]u8,
     command_len: u32,
     message_buffer: [message_len_max]u8,
     message_len: u32,
     hints: links.Hints = .{},
-    /// Positions on either side of link jumps, in chronological order.
+    search_query: ?search.Query = null,
+    search_request: ?search.Request = null,
+    /// Repeats typed before a search from the viewport has found its first match.
+    search_repeats: i32 = 0,
+    search_id: u64 = 0,
+    search_visible: bool = false,
+    /// The search cursor persists independently of scrolling and resizing.
+    search_selection: ?search.Navigation.Match = null,
+    /// Positions on either side of link and search jumps, in chronological order.
     jumps: [64]Position = undefined,
     jump_index: usize = 0,
     jump_end: usize = 0,
@@ -179,19 +191,29 @@ pub const State = struct {
             .key => |key| {
                 state.message_len = 0;
                 if (state.hints.mode != .off) return state.editHints(key);
-                if (state.command_open) return state.editCommand(key);
-                return state.apply(state.keymap.feed(key) orelse return .none);
+                if (state.prompt != .none) return state.editCommand(key);
+                const action = state.keymap.feed(key) orelse if (key == .escape) .hide_search else return .none;
+                const before = if (state.search_request != null) state.position() else null;
+                const effect = state.apply(action);
+                if (before != null and effect == .none and !std.meta.eql(before.?, state.position())) {
+                    state.search_request = null;
+                    return .cancel_search;
+                }
+                return effect;
             },
             .resize => |size| {
                 const changed = !std.meta.eql(size, state.size);
                 const cancel_lookup = changed and state.hints.mode == .loading;
                 if (changed and state.hints.mode != .confirm) state.hints.close();
+                const cancel_search = changed and state.search_request != null;
+                if (cancel_search) state.search_request = null;
                 const old_width = state.geometry.view_width;
                 state.size = size;
                 state.relayout();
                 if (state.geometry.view_width != old_width and state.document.page_sizes.len > 0)
                     state.panToPage(state.centrePage(), .if_hidden);
                 if (cancel_lookup) return .cancel_links;
+                if (cancel_search) return .cancel_search;
             },
             .document => |doc| {
                 std.debug.assert(doc.page_offsets.len == doc.page_sizes.len);
@@ -201,6 +223,10 @@ pub const State = struct {
                 state.hints.close();
                 state.jump_index = 0;
                 state.jump_end = 0;
+                state.search_request = null;
+                state.search_selection = null;
+                state.search_visible = false;
+                if (state.search_query) |*query| query.generation = doc.generation;
                 state.document = doc;
                 state.relayout();
             },
@@ -215,6 +241,37 @@ pub const State = struct {
                 state.hints.links = result.links;
                 state.hints.incomplete = result.incomplete;
                 state.hints.show(state.geometry, state.size, state.anchor, state.pan_x);
+            },
+            .search_result => |result| {
+                const request = state.search_request orelse return .none;
+                if (request.id != result.id) return .none;
+                state.search_request = null;
+                const repeats = state.search_repeats;
+                state.search_repeats = 0;
+                const match = result.match orelse {
+                    state.search_visible = false;
+                    state.search_selection = null;
+                    return state.update(.{ .message = if (result.incomplete) "Search incomplete: no match found" else "Pattern not found" });
+                };
+                const origin = state.position();
+                const geometry = state.geometry;
+                const height: f32 = @floatFromInt(geometry.pageHeight(match.page));
+                const y: i64 = @intFromFloat(@round((match.area.y0 + match.area.y1) / 2 * height));
+                state.anchor = geometry.anchorAt(geometry.pageTop(match.page) + y - geometry.view_height / 2);
+                state.panToPage(match.page, .always);
+                const width = geometry.pageWidth(match.page);
+                if (width > geometry.view_width) {
+                    const page_left = (geometry.content_width -| width) / 2;
+                    const x = page_left + @as(u32, @intFromFloat((match.area.x0 + match.area.x1) / 2 * @as(f32, @floatFromInt(width))));
+                    if (x < state.pan_x or x >= state.pan_x + geometry.view_width)
+                        state.pan_x = std.math.clamp(x -| geometry.view_width / 2, page_left, page_left + width - geometry.view_width);
+                }
+                state.recordJump(origin);
+                state.search_selection = match;
+                state.search_visible = true;
+                if (repeats != 0) return state.repeatSearch(repeats);
+                if (result.incomplete or result.wrapped)
+                    return state.update(.{ .message = if (result.incomplete) "Match found; search incomplete" else "Search wrapped" });
             },
             .message => |text| {
                 state.message_len = @intCast(@min(text.len, message_len_max));
@@ -265,25 +322,46 @@ pub const State = struct {
             .zoom_fit_width => state.setZoom(1),
             .toggle_dark => state.dark = !state.dark,
             .open_command_line => {
-                state.command_open = true;
+                state.prompt = .command;
                 state.command_len = 0;
+                if (state.search_request != null) {
+                    state.search_request = null;
+                    return .cancel_search;
+                }
+            },
+            .open_search => {
+                state.prompt = .search;
+                state.command_len = 0;
+                if (state.search_request != null) {
+                    state.search_request = null;
+                    return .cancel_search;
+                }
+            },
+            .repeat_search => |n| return state.repeatSearch(n),
+            .hide_search => {
+                if (state.search_visible or state.search_request != null) {
+                    state.search_visible = false;
+                    state.search_request = null;
+                    return .cancel_search;
+                }
             },
             .follow_link => {
                 if (state.document.generation == 0)
                     return state.update(.{ .message = "Still loading the document" });
                 if (state.document.page_sizes.len == 0 or state.geometry.view_height == 0)
                     return state.update(.{ .message = "No links in view" });
+                state.search_request = null;
                 state.hints.request_id = @max(1, state.hints.request_id +% 1);
                 state.hints.mode = .loading;
                 return .find_links;
             },
-            .older_link_jump, .newer_link_jump => {
+            .older_jump, .newer_jump => {
                 const index = state.jump_index;
-                if ((action == .older_link_jump and index == 0) or
-                    (action == .newer_link_jump and index == state.jump_end))
-                    return state.update(.{ .message = if (action == .older_link_jump) "No earlier jump" else "No later jump" });
+                if ((action == .older_jump and index == 0) or
+                    (action == .newer_jump and index == state.jump_end))
+                    return state.update(.{ .message = if (action == .older_jump) "No earlier jump" else "No later jump" });
                 state.jumps[index] = state.position();
-                state.jump_index = if (action == .older_link_jump) index - 1 else index + 1;
+                state.jump_index = if (action == .older_jump) index - 1 else index + 1;
                 const saved = state.jumps[state.jump_index];
                 state.anchor = saved.anchor;
                 state.pan_x = saved.pan_x;
@@ -446,8 +524,53 @@ pub const State = struct {
         state.jump_end = state.jump_index;
     }
 
+    fn repeatSearch(state: *State, n: i32) Effect {
+        const query = state.search_query orelse return state.update(.{ .message = "Use / to search" });
+        if (state.document.page_sizes.len == 0)
+            return state.update(.{ .message = "No pages to search" });
+        var steps = n;
+        if (state.search_request) |pending| {
+            if (pending.after == null) {
+                // The first match establishes the search cursor. In particular,
+                // a fast N must step back from it once the worker finds it.
+                state.search_repeats = std.math.clamp(state.search_repeats + n, -1_000_000, 1_000_000);
+                return .none;
+            }
+            // Key repeat may outrun the worker. Replace it with the aggregate
+            // distance from the same origin, avoiding a queue of stale jumps.
+            const previous: i32 = @intCast(pending.count);
+            steps = std.math.clamp(n + if (pending.backward) -previous else previous, -1_000_000, 1_000_000);
+            if (steps == 0) {
+                state.search_request = null;
+                return .cancel_search;
+            }
+        }
+        const selection = state.search_selection;
+        const page, const y = if (selection) |match| .{ match.page, @as(f32, 0) } else origin: {
+            const geometry = state.geometry;
+            const centre = geometry.offsetOf(state.anchor) + geometry.view_height / 2;
+            const page = geometry.pageAt(centre);
+            const height = geometry.pageHeight(page);
+            const offset = std.math.clamp(centre - geometry.pageTop(page), 0, height);
+            break :origin .{ page, @as(f32, @floatFromInt(offset)) / @as(f32, @floatFromInt(height)) };
+        };
+        state.search_repeats = 0;
+        state.search_id = @max(1, state.search_id +% 1);
+        state.search_request = .{
+            .id = state.search_id,
+            .query = query,
+            .page = page,
+            .y = y,
+            .after = if (selection) |match| match.part else null,
+            .backward = steps < 0,
+            .count = @abs(steps),
+        };
+        state.search_visible = true;
+        return .find_text;
+    }
+
     fn editCommand(state: *State, key: terminal.Key) Effect {
-        std.debug.assert(state.command_open);
+        std.debug.assert(state.prompt != .none);
         switch (key) {
             .char => |char| {
                 var utf8: [4]u8 = undefined;
@@ -458,7 +581,7 @@ pub const State = struct {
             },
             .backspace => {
                 if (state.command_len == 0) {
-                    state.command_open = false;
+                    state.prompt = .none;
                 } else {
                     // Drop the last whole character.
                     state.command_len -= 1;
@@ -467,10 +590,27 @@ pub const State = struct {
                     }
                 }
             },
-            .escape, .ctrl => state.command_open = false,
+            .escape, .ctrl => state.prompt = .none,
             .enter => {
-                state.command_open = false;
+                const prompt = state.prompt;
+                state.prompt = .none;
                 const line = state.command_buffer[0..state.command_len];
+                if (prompt == .search) {
+                    if (line.len > 0) {
+                        state.search_id = @max(1, state.search_id +% 1);
+                        var query: search.Query = .{
+                            .generation = state.document.generation,
+                            .id = state.search_id,
+                            .bytes = undefined,
+                            .len = @intCast(line.len),
+                        };
+                        @memcpy(query.bytes[0..line.len], line);
+                        query.bytes[line.len] = 0;
+                        state.search_query = query;
+                        state.search_selection = null;
+                    }
+                    return state.repeatSearch(1);
+                }
                 return state.runCommand(std.mem.trim(u8, line, " "));
             },
             else => {},
@@ -491,6 +631,7 @@ pub const State = struct {
         }
         if (std.mem.eql(u8, name, "q") or std.mem.eql(u8, name, "quit")) return .quit;
         if (std.mem.eql(u8, name, "reload")) return .reload;
+        if (std.mem.eql(u8, name, "noh")) return state.apply(.hide_search);
         if (std.mem.eql(u8, name, "dark")) return state.apply(.toggle_dark);
         if (std.mem.eql(u8, name, "zoom")) {
             // Plain decimals only: parseFloat also takes `nan` and hex.
@@ -508,9 +649,9 @@ pub const State = struct {
     /// message or else the file name, with the position on the right.
     fn writeStatus(state: *const State, frame: *Frame) void {
         var writer: std.Io.Writer = .fixed(&frame.status_buffer);
-        frame.status_keep_end = state.command_open;
-        if (state.command_open) {
-            writer.print(":{s}", .{state.command_buffer[0..state.command_len]}) catch {};
+        frame.status_keep_end = state.prompt != .none;
+        if (state.prompt != .none) {
+            writer.print("{c}{s}", .{ if (state.prompt == .search) @as(u8, '/') else ':', state.command_buffer[0..state.command_len] }) catch {};
             frame.status_left_len = @intCast(writer.end);
             frame.status_right_len = 0;
             return;
@@ -551,7 +692,13 @@ pub const State = struct {
             frame.status_right_len = @intCast(writer.end - frame.status_left_len);
             return;
         }
-        writer.writeAll(if (message.len > 0) message else state.file_name) catch {};
+        if (state.search_request) |request| {
+            writer.print("Searching for {s}...  Esc cancel", .{request.query.text()}) catch {};
+        } else if (message.len == 0 and state.search_visible) {
+            writer.print("/{s}", .{state.search_query.?.text()}) catch {};
+        } else {
+            writer.writeAll(if (message.len > 0) message else state.file_name) catch {};
+        }
         frame.status_left_len = @intCast(writer.end);
         const pages = state.document.page_sizes.len;
         if (state.document.generation == 0) {
@@ -684,7 +831,7 @@ test "command line" {
     viewer.init();
     _ = viewer.feed(":3\r");
     try std.testing.expectEqual(2, viewer.state.anchor.page);
-    try std.testing.expect(!viewer.state.command_open);
+    try std.testing.expect(viewer.state.prompt == .none);
     _ = viewer.feed(":zoom 50\r");
     try std.testing.expectEqual(0.5, viewer.state.zoom);
     try std.testing.expectEqual(.reload, viewer.feed(":reload\r"));
@@ -706,7 +853,7 @@ test "command line" {
     _ = viewer.state.update(.{ .key = .backspace });
     try std.testing.expectEqual(0, viewer.state.command_len);
     _ = viewer.state.update(.{ .key = .backspace });
-    try std.testing.expect(!viewer.state.command_open);
+    try std.testing.expect(viewer.state.prompt == .none);
 }
 
 test "a reload keeps the position, clamped to the new page count" {

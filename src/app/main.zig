@@ -19,10 +19,12 @@ const viewer = @import("../viewer/main.zig");
 
 // local
 const Cache = @import("Cache.zig");
+const Highlights = @import("Highlights.zig");
 const Renderer = @import("Renderer.zig");
 
 // aliases
 const posix = std.posix;
+const search = viewer.search;
 
 // ====================================================================================================
 // Constants
@@ -54,6 +56,18 @@ pub const Options = struct {
     medium: graphics.Medium,
 };
 
+/// When the viewport and its loaded tiles are unchanged, prompt typing and
+/// speculative tile results need only redraw the status line. Search may
+/// have hundreds of graphics placements, so avoid retransmitting them.
+const SearchFrame = struct {
+    generation: u32,
+    query: u64,
+    anchor: viewer.Anchor,
+    pan_x: u32,
+    zoom: f32,
+    dark: bool,
+};
+
 pub const App = struct {
     gpa: std.mem.Allocator,
     state: viewer.State,
@@ -64,6 +78,14 @@ pub const App = struct {
     page_offsets: []f64,
     /// Owns the link strings borrowed by the viewer while hints are active.
     link_arena: ?std.heap.ArenaAllocator = null,
+    search_pages: [search.pages_max]?search.Page = @splat(null),
+    /// Pin the pages chosen for this viewport while older results arrive.
+    highlight_pages: [search.pages_max]u32 = undefined,
+    highlight_pages_len: usize = 0,
+    highlights: Highlights = .{},
+    search_frame: ?SearchFrame = null,
+    painted_images: [viewer.tiles_max]graphics.ImageId = undefined,
+    painted_images_len: usize = 0,
     url_to_open: ?[]u8 = null,
     frame: viewer.Frame,
     results: std.ArrayList(Renderer.Result),
@@ -122,6 +144,7 @@ pub const App = struct {
         app.gpa.free(app.page_sizes);
         app.gpa.free(app.page_offsets);
         if (app.link_arena) |arena| arena.deinit();
+        app.clearSearchPages();
         if (app.url_to_open) |url| app.gpa.free(url);
         app.* = undefined;
     }
@@ -173,6 +196,18 @@ pub const App = struct {
                 return false;
             };
             if (graphics.Reply.parse(unread[0..decoded.len])) |reply| {
+                switch (app.highlights.reject(reply)) {
+                    .ignored => {},
+                    .retry => {
+                        app.search_frame = null;
+                        app.dirty = true;
+                    },
+                    .failed => {
+                        app.search_frame = null;
+                        _ = app.state.update(.{ .message = "Terminal cannot display search highlights" });
+                        app.dirty = true;
+                    },
+                }
                 switch (app.cache.reject(reply)) {
                     .ignored => {},
                     .retry => app.dirty = true,
@@ -220,7 +255,7 @@ pub const App = struct {
         try app.renderer.collect(&app.results);
         defer app.results.clearRetainingCapacity();
         for (app.results.items) |result| {
-            app.dirty = true;
+            if (result != .search) app.dirty = true;
             app.take(result) catch {
                 // Later results may describe a reload the viewer must observe.
                 _ = app.state.update(.{ .message = "out of memory" });
@@ -240,7 +275,10 @@ pub const App = struct {
         app.cache.beginFrame(visible);
 
         var missing: [viewer.tiles_max]viewer.Tile = undefined;
-        app.renderer.want(app.cache.findMissing(frame.wanted(), &missing));
+        const visible_missing = app.cache.findMissing(visible, &missing).len;
+        const speculative_missing = app.cache.findMissing(frame.wanted()[visible.len..], missing[visible_missing..]).len;
+        app.renderer.want(missing[0 .. visible_missing + speculative_missing], visible_missing);
+        try app.cache.reserve(output, if (app.state.search_visible) Highlights.budget_bytes else 0);
         app.dirty = try app.cache.upload(app.gpa, output, visible, upload_bytes_per_frame);
 
         try output.writeAll(terminal.sync_begin);
@@ -254,19 +292,45 @@ pub const App = struct {
         }
         app.preview_drawn = frame.preview != null;
         const size = app.state.size;
-        try graphics.clearPlacements(output);
-        for (frame.slices()) |slice| {
-            const image = app.cache.shown(slice.tile) orelse continue;
-            try graphics.place(output, .{
-                .image = image,
-                .source = .{ .x = slice.source_x, .y = slice.source_y, .width = slice.width, .height = slice.height },
-                .col = @intCast(slice.x / size.cell_width),
-                .row = @intCast(slice.y / size.cell_height),
-                .x_offset = @intCast(slice.x % size.cell_width),
-                .y_offset = @intCast(slice.y % size.cell_height),
-                .behind_text = app.drew_overlay,
-            });
+        var images: [viewer.tiles_max]graphics.ImageId = undefined;
+        const shown = images[0..visible.len];
+        for (shown, visible) |*id, tile| id.* = app.cache.shown(tile) orelse 0;
+        const scene: ?SearchFrame = if (app.state.search_visible and !app.drew_overlay) .{
+            .generation = app.state.document.generation,
+            .query = app.state.search_query.?.id,
+            .anchor = app.state.anchor,
+            .pan_x = app.state.pan_x,
+            .zoom = app.state.zoom,
+            .dark = app.state.dark,
+        } else null;
+        const reuse_scene = !force_repaint and scene != null and std.meta.eql(scene, app.search_frame) and
+            std.mem.eql(graphics.ImageId, shown, app.painted_images[0..app.painted_images_len]);
+        if (!reuse_scene) {
+            try graphics.clearPlacements(output);
+            for (frame.slices(), shown) |slice, image| {
+                if (image == 0) continue;
+                try graphics.place(output, .{
+                    .image = image,
+                    .source = .{ .x = slice.source_x, .y = slice.source_y, .width = slice.width, .height = slice.height },
+                    .col = @intCast(slice.x / size.cell_width),
+                    .row = @intCast(slice.y / size.cell_height),
+                    .x_offset = @intCast(slice.x % size.cell_width),
+                    .y_offset = @intCast(slice.y % size.cell_height),
+                    .behind_text = app.drew_overlay,
+                });
+            }
+            if (app.state.search_visible) {
+                try app.drawSearch(output);
+            } else {
+                app.highlights.clear(output);
+                app.highlight_pages_len = 0;
+            }
+            if (scene != null) {
+                @memcpy(app.painted_images[0..shown.len], shown);
+                app.painted_images_len = shown.len;
+            }
         }
+        app.search_frame = scene;
         if (app.drew_overlay) try drawOverlay(output, frame, size);
         try drawStatus(output, frame.status(), size);
         try output.writeAll(terminal.sync_end);
@@ -293,11 +357,18 @@ pub const App = struct {
             .quit => return true,
             .reload => app.renderer.reload(),
             .find_links => {
+                app.search_frame = null;
+                app.renderer.cancelText();
                 if (app.link_arena) |arena| arena.deinit();
                 app.link_arena = null;
                 app.renderer.findLinks(app.state.linkRequest());
             },
             .cancel_links => app.renderer.cancelLinks(),
+            .find_text => app.renderer.findText(app.state.search_request.?),
+            .cancel_search => {
+                app.search_frame = null;
+                app.renderer.cancelText();
+            },
             .open_url => |url| {
                 if (app.url_to_open) |old| app.gpa.free(old);
                 app.url_to_open = app.gpa.dupe(u8, url) catch blk: {
@@ -307,6 +378,85 @@ pub const App = struct {
             },
         }
         return false;
+    }
+
+    fn clearSearchPages(app: *App) void {
+        for (&app.search_pages) |*entry| {
+            if (entry.*) |page| app.gpa.free(page.parts);
+            entry.* = null;
+        }
+    }
+
+    fn drawSearch(app: *App, output: *std.Io.Writer) (std.mem.Allocator.Error || std.Io.Writer.Error)!void {
+        const state = &app.state;
+        const query = state.search_query orelse return;
+        const active = state.search_selection;
+        const geometry = state.geometry;
+        const top = geometry.offsetOf(state.anchor);
+        var needed: search.Viewport = .{ .query = query, .pages = undefined, .len = 0 };
+        var cached: [search.pages_max]search.Page = undefined;
+        var cached_len: usize = 0;
+        app.highlight_pages_len = 0;
+        if (active) |match| {
+            for (app.frame.slices()) |slice| {
+                if (slice.tile.page == match.page) {
+                    app.highlight_pages[0] = match.page;
+                    app.highlight_pages_len = 1;
+                    break;
+                }
+            }
+        }
+        var previous: ?u32 = null;
+        for (app.frame.slices()) |slice| {
+            const page = slice.tile.page;
+            if (page == previous or (active != null and active.?.page == page)) continue;
+            previous = page;
+            if (app.highlight_pages_len == search.pages_max) break;
+            app.highlight_pages[app.highlight_pages_len] = page;
+            app.highlight_pages_len += 1;
+        }
+        pages: for (app.highlight_pages[0..app.highlight_pages_len]) |page| {
+            for (app.search_pages) |slot| {
+                if (slot != null and slot.?.number == page and slot.?.query_id == query.id and slot.?.generation == query.generation) {
+                    const entry = slot.?;
+                    cached[cached_len] = entry;
+                    cached_len += 1;
+                    continue :pages;
+                }
+            }
+            needed.pages[needed.len] = page;
+            needed.len += 1;
+        }
+        app.renderer.wantSearchPages(needed);
+
+        // Active rectangles get space first even when there are many other hits.
+        var regions: [256]Highlights.Region = undefined;
+        var len: usize = 0;
+        full: for ([2]bool{ true, false }) |active_pass| {
+            if (active_pass and active == null) continue;
+            for (cached[0..cached_len]) |entry| {
+                const active_part: ?usize = if (active != null and active.?.page == entry.number) active.?.part else null;
+                if (active_pass and active_part == null) continue;
+                var is_active = false;
+                for (entry.parts, 0..) |part, i| {
+                    if (part.first) is_active = i == active_part;
+                    if (is_active != active_pass) continue;
+                    const rect = search.screenRect(geometry, top, state.pan_x, entry.number, part.area) orelse continue;
+                    regions[len] = .{ .rect = .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height }, .active = is_active };
+                    len += 1;
+                    if (len == regions.len) break :full;
+                }
+            }
+            // The selected area remains available when copying page matches
+            // out of the render worker fails.
+            if (active_pass and len == 0) {
+                if (search.screenRect(geometry, top, state.pan_x, active.?.page, active.?.area)) |rect| {
+                    regions[0] = .{ .rect = .{ .x = rect.x, .y = rect.y, .width = rect.width, .height = rect.height }, .active = true };
+                    len = 1;
+                }
+            }
+        }
+        try app.highlights.draw(app.gpa, output, regions[0..len], state.size, state.dark, app.drew_overlay);
     }
 
     fn take(app: *App, result: Renderer.Result) std.mem.Allocator.Error!void {
@@ -323,6 +473,7 @@ pub const App = struct {
                 app.page_offsets = opened.page_offsets;
                 if (app.link_arena) |arena| arena.deinit();
                 app.link_arena = null;
+                app.clearSearchPages();
             },
             .open_failed => |err| {
                 if (app.state.document.generation == 0) app.open_error = err;
@@ -339,6 +490,53 @@ pub const App = struct {
                 if (app.link_arena) |arena| arena.deinit();
                 app.link_arena = links.arena;
                 _ = app.state.update(.{ .links = links.view });
+            },
+            .search => |found| {
+                if (found.page) |page| {
+                    const query = app.state.search_query;
+                    if (query != null and page.query_id == query.?.id and page.generation == query.?.generation) {
+                        const pinned = app.highlight_pages[0..app.highlight_pages_len];
+                        var replacement: ?*?search.Page = null;
+                        for (&app.search_pages) |*slot| {
+                            if (slot.*) |old| {
+                                if (old.number == page.number and old.query_id == page.query_id and old.generation == page.generation) {
+                                    replacement = slot;
+                                    break;
+                                }
+                                if (replacement == null and (old.query_id != page.query_id or old.generation != page.generation or
+                                    std.mem.findScalar(u32, pinned, old.number) == null))
+                                    replacement = slot;
+                            } else if (replacement == null or replacement.?.* != null) {
+                                replacement = slot;
+                            }
+                        }
+                        if (replacement == null and found.navigation != null) replacement = &app.search_pages[0];
+                        if (replacement) |slot| {
+                            const had_hits = slot.* != null and slot.*.?.parts.len > 0 and slot.*.?.query_id == page.query_id;
+                            if (slot.*) |old| app.gpa.free(old.parts);
+                            slot.* = page;
+                            if ((had_hits or page.parts.len > 0) and app.state.search_visible and
+                                std.mem.findScalar(u32, pinned, page.number) != null)
+                            {
+                                app.search_frame = null;
+                                app.dirty = true;
+                            }
+                        } else {
+                            app.gpa.free(page.parts);
+                        }
+                    } else {
+                        app.gpa.free(page.parts);
+                    }
+                }
+                if (found.navigation) |navigation| {
+                    if (app.state.search_request) |request| {
+                        if (request.id == navigation.id) {
+                            _ = app.apply(app.state.update(.{ .search_result = navigation }));
+                            app.search_frame = null;
+                            app.dirty = true;
+                        }
+                    }
+                }
             },
             .render_failed => |tile| {
                 try app.cache.putFailed(app.gpa, tile);
@@ -423,6 +621,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
 
     try output.writeAll(terminal.fullscreen_enter);
     defer {
+        app.highlights.clear(output);
         app.cache.clear(gpa, output);
         output.writeAll(terminal.fullscreen_leave) catch {};
         output.flush() catch {};
@@ -755,6 +954,103 @@ test "link hints follow a clipped viewport, preserve their codes, and leave no s
     try std.testing.expectEqualStrings(url, app.frame.preview.?.uri);
 }
 
+test "EPUB search crosses chapters, highlights the match, and can be canceled or repeated" {
+    const gpa = std.testing.allocator;
+    const size: terminal.Size = .{ .cols = 80, .rows = 25, .cell_width = 10, .cell_height = 20 };
+    const emulator: *Emulator = try .create(std.testing.io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(std.testing.io, gpa, .{
+        .path = "src/document/testdata/chapters.epub",
+        .page = 1,
+        .dark = false,
+        .watch = false,
+        .medium = .direct,
+    }, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+    try std.testing.expect(!app.input("/Blue chapter\r\x1b"));
+    app.expireInput(app.escape_started.?.addDuration(.fromSeconds(1)));
+    try app.settle(&emulator.output);
+    try std.testing.expect(app.state.search_selection == null);
+    try std.testing.expectEqual(viewer.Anchor{ .page = 0, .y = 0 }, app.state.anchor);
+
+    try std.testing.expect(!app.input("n"));
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(2, app.state.search_selection.?.page);
+    const selected = app.state.anchor;
+    const with_highlight = try emulator.screenshot(gpa);
+    defer gpa.free(with_highlight.pixels);
+
+    // A status-only change should not resend either page or highlight placements.
+    var commands: std.Io.Writer.Allocating = .init(gpa);
+    defer commands.deinit();
+    try std.testing.expect(!app.input(":"));
+    try app.draw(&commands.writer);
+    try std.testing.expect(std.mem.find(u8, commands.written(), "\x1b_Ga=p") == null);
+    try std.testing.expect(!app.input("noh\r"));
+    try app.settle(&emulator.output);
+    const without = try emulator.screenshot(gpa);
+    defer gpa.free(without.pixels);
+    try std.testing.expectEqual(selected, app.state.anchor);
+    try std.testing.expect(!std.mem.eql(u8, with_highlight.pixels, without.pixels));
+
+    try std.testing.expect(!app.input("N"));
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(selected, app.state.anchor);
+    try std.testing.expectEqual(2, app.state.search_selection.?.page);
+    const again = try emulator.screenshot(gpa);
+    defer gpa.free(again.pixels);
+    try std.testing.expectEqualSlices(u8, with_highlight.pixels, again.pixels);
+}
+
+test "search repeats move from the selected match after scrolling or rapid input" {
+    const gpa = std.testing.allocator;
+    const size: terminal.Size = .{ .cols = 80, .rows = 25, .cell_width = 10, .cell_height = 20 };
+    const emulator = try Emulator.create(std.testing.io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    app.init(std.testing.io, gpa, .{
+        .path = "src/document/testdata/links.pdf",
+        .page = 1,
+        .dark = false,
+        .watch = false,
+        .medium = .direct,
+    }, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+    try std.testing.expect(!app.input("/Section\r"));
+    try app.settle(&emulator.output);
+    const first = app.state.search_selection.?;
+    // The fixture draws Sections 1 and 2 next to one another on page one.
+    try std.testing.expectEqual(0, first.page);
+    try std.testing.expectEqual(0, first.part);
+    try std.testing.expect(!app.input("2G"));
+    try std.testing.expectEqual(1, app.state.anchor.page);
+    try std.testing.expect(!app.input("n"));
+    try app.settle(&emulator.output);
+    const second = app.state.search_selection.?;
+    try std.testing.expectEqual(0, second.page);
+    try std.testing.expectEqual(1, second.part);
+
+    try std.testing.expect(!app.input("2GN"));
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(first, app.state.search_selection.?);
+
+    try std.testing.expect(!app.input("2G/Section\rn"));
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(second, app.state.search_selection.?);
+    // Both repeat keys arrive before the worker sees the new query.
+    try std.testing.expect(!app.input("2G/Section\rnN"));
+    try app.settle(&emulator.output);
+    try std.testing.expectEqual(first, app.state.search_selection.?);
+
+    try std.testing.expect(!app.input("/ Section \r"));
+    try std.testing.expectEqualStrings(" Section ", app.state.search_request.?.query.text());
+}
+
 test "shows the document, and keys move through it" {
     const gpa = std.testing.allocator;
     const size: terminal.Size = .{ .cols = 40, .rows = 11, .cell_width = 10, .cell_height = 20 };
@@ -894,7 +1190,7 @@ test "navigation sequences survive every input split without closing commands" {
                 try std.testing.expect(!fragmented.input(sequence[split..]));
                 try std.testing.expectEqual(reference.state.anchor, fragmented.state.anchor);
                 try std.testing.expectEqual(reference.state.pan_x, fragmented.state.pan_x);
-                try std.testing.expectEqual(reference.state.command_open, fragmented.state.command_open);
+                try std.testing.expectEqual(reference.state.prompt, fragmented.state.prompt);
                 try std.testing.expectEqual(0, fragmented.pending_input_len);
                 if (command) {
                     try std.testing.expect(!fragmented.input("\r"));
@@ -914,9 +1210,9 @@ test "standalone Escape closes the command only after its deadline" {
     try std.testing.expect(!app.input(":zoom 200\x1b"));
     const started = app.escape_started.?;
     app.expireInput(started.addDuration(.fromMilliseconds(escape_timeout_ms - 1)));
-    try std.testing.expect(app.state.command_open);
+    try std.testing.expect(app.state.prompt == .command);
     app.expireInput(started.addDuration(.fromMilliseconds(escape_timeout_ms)));
-    try std.testing.expect(!app.state.command_open);
+    try std.testing.expect(app.state.prompt == .none);
     try std.testing.expectEqual(0, app.pending_input_len);
     try std.testing.expect(app.input("q"));
 }

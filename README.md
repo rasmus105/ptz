@@ -43,7 +43,8 @@ ptz photo.jpg
 | `+` / `-` / `=` | Zoom in / out / fit width |
 | `Left` / `Right` | Pan when zoomed in |
 | `f` | Show hints for visible links. Type a hint to follow it, `Backspace` to edit, `Tab` for more, or `Esc` to cancel |
-| `Ctrl-o` / `Ctrl-i` (`Tab`) | Go back / forward through link jumps |
+| `/`, `n` / `N` | Search text, next / previous match. `Esc` or `:noh` hides highlights |
+| `Ctrl-o` / `Ctrl-i` (`Tab`) | Go back / forward through link and search jumps |
 | `i` | Toggle dark mode |
 | `:` | Command line: `:{n}`, `:zoom {percent}`, `:dark`, `:reload`, `:q` |
 | `q`, `Ctrl-c` | Quit |
