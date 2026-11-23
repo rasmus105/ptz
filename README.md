@@ -11,7 +11,10 @@ brew upgrade ptz
 
 **Usage:**
 ```bash
-ptz [options] <file>
+ptz [options] [<path>]
+
+ptz
+ptz scans/
 
 ptz my-document.pdf
 ptz book.epub
@@ -31,6 +34,10 @@ ptz photo.jpg
 - Renders in the background and, in a local terminal, sends pages through shared
   memory, so scrolling and zooming stay fast
 
+With a directory or no path, ptz opens the first usable file in natural filename
+order. File navigation browses the same directory without wrapping or entering
+subdirectories.
+
 ## Shortcuts
 
 | Keys | Action |
@@ -39,6 +46,7 @@ ptz photo.jpg
 | `Ctrl-d` / `Ctrl-u` | Scroll half a screen |
 | `Ctrl-f` / `Ctrl-b`, `Space`, `PageDown` / `PageUp` | Scroll a screen |
 | `l` / `h` | Next / previous page |
+| `L` / `H` | Next / previous file |
 | `gg` / `G`, `{n}G` | First / last page, page `n` |
 | `+` / `-` / `=` | Zoom in / out / fit width |
 | `Left` / `Right` | Pan when zoomed in |

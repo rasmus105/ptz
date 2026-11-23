@@ -85,6 +85,7 @@ pub const Effect = union(enum) {
     none,
     quit,
     reload,
+    move_files: i32,
     find_links,
     cancel_links,
     find_text,
@@ -318,6 +319,7 @@ pub const State = struct {
                 state.pan_x = @intCast(std.math.clamp(pan, 0, state.geometry.panMax()));
             },
             .move_pages => |n| state.gotoPage(@as(i64, state.anchor.page) + n),
+            .move_files => |n| return .{ .move_files = n },
             .goto_page => |page| state.gotoPage(@as(i64, page) - 1),
             .goto_last_page => state.gotoPage(std.math.maxInt(i32)),
             .zoom_steps => |n| state.setZoom(state.zoom * std.math.pow(f32, zoom_step, @floatFromInt(n))),

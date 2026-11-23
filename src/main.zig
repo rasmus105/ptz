@@ -50,19 +50,21 @@ pub fn main(init: std.process.Init) !void {
     );
 
     app.run(io, init.gpa, .{
-        .path = options.file,
+        .path = options.path,
         .page = options.page,
         .dark = options.dark,
         .watch = options.watch,
         .medium = medium,
     }, size, stdout) catch |err| switch (err) {
-        error.FileNotFound => fail("cannot open {q}: file not found", .{options.file}),
-        error.IsDir => fail("cannot open {q}: is a directory", .{options.file}),
-        error.AccessDenied => fail("cannot open {q}: permission denied", .{options.file}),
-        error.FileTooBig => fail("cannot open {q}: file too big", .{options.file}),
-        error.InvalidFormat => fail("cannot open {q}: unsupported or corrupted document", .{options.file}),
-        error.PasswordRequired => fail("cannot open {q}: password protected", .{options.file}),
-        error.UnsupportedSecurity => fail("cannot open {q}: unsupported encryption", .{options.file}),
+        error.NoUsableFile => fail("no usable documents or images in {q}", .{options.path}),
+        error.CannotReadDirectory => fail("cannot read directory {q}", .{options.path}),
+        error.FileNotFound => fail("cannot open {q}: file not found", .{options.path}),
+        error.IsDir => fail("cannot open {q}: is a directory", .{options.path}),
+        error.AccessDenied => fail("cannot open {q}: permission denied", .{options.path}),
+        error.FileTooBig => fail("cannot open {q}: file too big", .{options.path}),
+        error.InvalidFormat => fail("cannot open {q}: unsupported or corrupted document", .{options.path}),
+        error.PasswordRequired => fail("cannot open {q}: password protected", .{options.path}),
+        error.UnsupportedSecurity => fail("cannot open {q}: unsupported encryption", .{options.path}),
         else => return err,
     };
 }

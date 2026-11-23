@@ -104,27 +104,60 @@ pub const Link = struct {
 pub const Document = struct {
     gpa: std.mem.Allocator,
     bytes: []const u8,
+    stat: ?std.Io.File.Stat,
     backend: mupdf.Document,
 
-    pub const OpenMode = enum { initial, replacement };
+    pub const OpenMode = enum {
+        initial,
+        replacement,
+        /// Discovery requires a regular file with at least one usable page.
+        browse,
+    };
 
     pub fn open(io: std.Io, gpa: std.mem.Allocator, path: []const u8) Error!Document {
         return openSnapshot(io, gpa, path, .initial);
     }
 
     pub fn openSnapshot(io: std.Io, gpa: std.mem.Allocator, path: []const u8, mode: OpenMode) Error!Document {
-        const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(file_size_max)) catch |err| return switch (err) {
+        const file = if (mode != .initial) blk: {
+            // A directory entry may be replaced after enumeration. Open without
+            // waiting on FIFOs and verify the opened descriptor before reading.
+            const name = std.posix.toPosixPath(path) catch return error.FileNotFound;
+            const fd = std.c.open(&name, .{ .NONBLOCK = true, .NOCTTY = true, .CLOEXEC = true });
+            if (fd < 0) return switch (std.posix.errno(fd)) {
+                .NOENT, .NOTDIR => error.FileNotFound,
+                .ACCES, .PERM => error.AccessDenied,
+                else => error.Unexpected,
+            };
+            break :blk std.Io.File{ .handle = fd, .flags = .{ .nonblocking = true } };
+        } else std.Io.Dir.cwd().openFile(io, path, .{ .allow_directory = false }) catch |err| return switch (err) {
             error.FileNotFound => error.FileNotFound,
             error.IsDir => error.IsDir,
             error.AccessDenied, error.PermissionDenied => error.AccessDenied,
+            else => error.Unexpected,
+        };
+        defer file.close(io);
+        // Record the descriptor metadata before reading the snapshot so the
+        // watcher can detect a write or replacement during the load.
+        const stat = file.stat(io) catch null;
+        if (mode != .initial) {
+            const metadata = stat orelse return error.Unexpected;
+            if (metadata.kind == .directory) return error.IsDir;
+            if (metadata.kind != .file or (mode == .browse and metadata.size == 0)) return error.InvalidFormat;
+            if (metadata.size >= file_size_max) return error.FileTooBig;
+        }
+        var reader = file.reader(io, &.{});
+        const bytes = reader.interface.allocRemaining(gpa, .limited(file_size_max)) catch |err| return switch (err) {
             error.StreamTooLong => error.FileTooBig,
             error.OutOfMemory => error.OutOfMemory,
-            else => error.Unexpected,
+            error.ReadFailed => error.Unexpected,
         };
         errdefer gpa.free(bytes);
 
-        const backend = try mupdf.Document.open(io, bytes, mode);
-        return .{ .gpa = gpa, .bytes = bytes, .backend = backend };
+        var backend = try mupdf.Document.open(io, bytes, mode);
+        errdefer backend.close();
+        if (mode == .browse and backend.pageCount() == 0) return error.InvalidFormat;
+        return .{ .gpa = gpa, .bytes = bytes, .stat = stat, .backend = backend };
     }
 
     pub fn close(doc: *Document) void {

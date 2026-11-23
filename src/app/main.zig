@@ -71,6 +71,8 @@ const SearchFrame = struct {
 pub const App = struct {
     gpa: std.mem.Allocator,
     state: viewer.State,
+    path: []const u8,
+    file_stamp: ?Watch.Stamp = null,
     renderer: Renderer,
     cache: Cache,
     /// The loaded document's page sizes and offsets, which `state` points to.
@@ -92,6 +94,10 @@ pub const App = struct {
     /// The start of a key sequence cut off at the end of the last input.
     pending_input: [pending_input_max]u8,
     pending_input_len: u32,
+    /// Defer decoded keys during a switch so they apply to its destination.
+    file_move_pending: bool = false,
+    deferred_keys: std.ArrayList(terminal.Key) = .empty,
+    quit_requested: bool = false,
     /// Once a control string exceeds the buffer, discard through its terminator
     /// rather than interpreting the remaining protocol bytes as user commands.
     discarding_string: bool,
@@ -104,7 +110,7 @@ pub const App = struct {
     drew_overlay: bool = false,
     preview_drawn: bool = false,
     /// Set when the document can't be loaded and there is nothing to show.
-    open_error: ?document.Error,
+    open_error: ?Renderer.OpenError,
 
     /// Initialized in place: the renderer must not move once started.
     pub fn init(
@@ -117,6 +123,7 @@ pub const App = struct {
     ) void {
         app.* = .{
             .gpa = gpa,
+            .path = options.path,
             .state = .init(std.fs.path.basename(options.path), size, options.dark, options.page),
             .renderer = undefined,
             .cache = .init(Cache.uploaded_bytes_max, Cache.pending_bytes_max),
@@ -140,6 +147,7 @@ pub const App = struct {
         app.renderer.deinit();
         for (app.results.items) |result| result.deinit(app.gpa);
         app.results.deinit(app.gpa);
+        app.deferred_keys.deinit(app.gpa);
         app.cache.deinit(app.gpa);
         app.gpa.free(app.page_sizes);
         app.gpa.free(app.page_offsets);
@@ -223,12 +231,7 @@ pub const App = struct {
                 continue;
             }
             unread = unread[decoded.len..];
-            if (decoded.key == .release) continue;
-            app.dirty = true;
-            if (decoded.key == .enter and !app.preview_drawn and app.state.linkPreviewOpen()) continue;
-            const effect = app.state.update(.{ .key = decoded.key });
-            app.preview_drawn = app.preview_drawn and app.state.linkPreviewOpen();
-            if (app.apply(effect)) return true;
+            if (app.handleKey(decoded.key)) return true;
         }
         return false;
     }
@@ -240,7 +243,7 @@ pub const App = struct {
         app.escape_started = null;
         app.pending_input_len = 0;
         app.dirty = true;
-        _ = app.apply(app.state.update(.{ .key = .escape }));
+        _ = app.handleKey(.escape);
     }
 
     pub fn resize(app: *App, size: terminal.Size) void {
@@ -260,6 +263,18 @@ pub const App = struct {
                 // Later results may describe a reload the viewer must observe.
                 _ = app.state.update(.{ .message = "out of memory" });
             };
+        }
+        if (!app.file_move_pending and app.deferred_keys.items.len > 0) {
+            var consumed: usize = 0;
+            for (app.deferred_keys.items) |key| {
+                consumed += 1;
+                if (app.handleKey(key)) {
+                    app.quit_requested = true;
+                    break;
+                }
+                if (app.file_move_pending) break;
+            }
+            app.deferred_keys.replaceRangeAssumeCapacity(0, consumed, &.{});
         }
     }
 
@@ -345,10 +360,26 @@ pub const App = struct {
         std.debug.assert(app.renderer.thread == null);
         while (true) {
             try app.collect();
-            if (app.open_error != null) return;
+            if (app.open_error != null or app.quit_requested) return;
             if (app.dirty) try app.draw(output);
             if (!app.renderer.step() and !app.dirty) return;
         }
+    }
+
+    fn handleKey(app: *App, key: terminal.Key) bool {
+        if (key == .release) return false;
+        app.dirty = true;
+        if (app.file_move_pending) {
+            if (key == .ctrl and key.ctrl == 'c') return true;
+            app.deferred_keys.append(app.gpa, key) catch {
+                _ = app.state.update(.{ .message = "Out of memory" });
+            };
+            return false;
+        }
+        if (key == .enter and !app.preview_drawn and app.state.linkPreviewOpen()) return false;
+        const effect = app.state.update(.{ .key = key });
+        app.preview_drawn = app.preview_drawn and app.state.linkPreviewOpen();
+        return app.apply(effect);
     }
 
     fn apply(app: *App, effect: viewer.Effect) bool {
@@ -356,6 +387,10 @@ pub const App = struct {
             .none => {},
             .quit => return true,
             .reload => app.renderer.reload(),
+            .move_files => |count| {
+                app.file_move_pending = true;
+                app.renderer.moveFiles(count);
+            },
             .find_links => {
                 app.search_frame = null;
                 app.renderer.cancelText();
@@ -462,6 +497,17 @@ pub const App = struct {
     fn take(app: *App, result: Renderer.Result) std.mem.Allocator.Error!void {
         switch (result) {
             .opened => |opened| {
+                if (opened.moved) app.file_move_pending = false;
+                if (!std.mem.eql(u8, app.path, opened.path)) {
+                    const name = std.fs.path.basename(opened.path);
+                    if (app.state.document.generation == 0) {
+                        app.state.file_name = name;
+                    } else {
+                        app.state = .init(name, app.state.size, app.state.dark, 1);
+                    }
+                    app.path = opened.path;
+                }
+                app.file_stamp = if (opened.stat) |stat| .fromStat(stat) else null;
                 _ = app.state.update(.{ .document = .{
                     .generation = opened.generation,
                     .page_sizes = opened.page_sizes,
@@ -474,6 +520,10 @@ pub const App = struct {
                 if (app.link_arena) |arena| arena.deinit();
                 app.link_arena = null;
                 app.clearSearchPages();
+            },
+            .browse_failed => |message| {
+                app.file_move_pending = false;
+                _ = app.state.update(.{ .message = message });
             },
             .open_failed => |err| {
                 if (app.state.document.generation == 0) app.open_error = err;
@@ -561,10 +611,18 @@ const Watch = struct {
     pending: ?Stamp,
     checked: std.Io.Timestamp,
 
-    const Stamp = struct { size: u64, mtime: i96, inode: u64 };
+    const Stamp = struct {
+        size: u64,
+        mtime: i96,
+        inode: std.Io.File.INode,
 
-    fn init(io: std.Io, path: []const u8) Watch {
-        return .{ .path = path, .loaded = stamp(io, path), .pending = null, .checked = .now(io, .awake) };
+        fn fromStat(stat: std.Io.File.Stat) Stamp {
+            return .{ .size = stat.size, .mtime = stat.mtime.toNanoseconds(), .inode = stat.inode };
+        }
+    };
+
+    fn init(io: std.Io, path: []const u8, loaded: ?Stamp) Watch {
+        return .{ .path = path, .loaded = loaded, .pending = null, .checked = .now(io, .awake) };
     }
 
     /// Checks the file at most every `watch_interval_ms`.
@@ -592,7 +650,7 @@ const Watch = struct {
 
     fn stamp(io: std.Io, path: []const u8) ?Stamp {
         const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch return null;
-        return .{ .size = stat.size, .mtime = stat.mtime.toNanoseconds(), .inode = @intCast(stat.inode) };
+        return .fromStat(stat);
     }
 };
 
@@ -621,7 +679,8 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
     defer gpa.destroy(app);
     app.init(io, gpa, options, size, wake_fds[1]);
     defer app.deinit();
-    var watch: Watch = .init(io, options.path);
+    var watch: Watch = undefined;
+    var watched_generation: u32 = 0;
     try app.renderer.start();
 
     try output.writeAll(terminal.fullscreen_enter);
@@ -670,6 +729,7 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
         }
         app.expireInput(.now(io, .awake));
         try app.collect();
+        if (app.quit_requested) return;
         // Desktop openers may stay alive until the browser closes.
         var i: usize = 0;
         while (i < openers.items.len) {
@@ -703,7 +763,15 @@ pub fn run(io: std.Io, gpa: std.mem.Allocator, options: Options, size: terminal.
             }
             app.dirty = true;
         }
-        if (options.watch and watch.changed(io)) app.renderer.reload();
+        const generation = app.state.document.generation;
+        if (options.watch and generation != 0) {
+            if (watched_generation != generation) {
+                watched_generation = generation;
+                watch = .init(io, app.path, app.file_stamp);
+            } else if (watch.changed(io)) {
+                app.renderer.reloadWatched(watch.path);
+            }
+        }
     }
 }
 
@@ -790,6 +858,77 @@ test {
     _ = Cache;
     _ = Renderer;
     _ = @import("recovery_test.zig");
+}
+
+test "directory browsing skips unusable entries and keeps file and page motions separate" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(io, ".", gpa);
+    defer gpa.free(dir_path);
+    try tmp.dir.createDirPath(io, "scan0.pdf");
+    try tmp.dir.writeFile(io, .{ .sub_path = "scan0.pdf/nested.pdf", .data = @embedFile("../document/testdata/red-square.pdf") });
+    try tmp.dir.writeFile(io, .{ .sub_path = "scan1.pdf", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "scan3.pdf", .data = "unsupported" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "scan7.pdf", .data = @embedFile("../document/testdata/password.pdf") });
+
+    const size: terminal.Size = .{ .cols = 40, .rows = 11, .cell_width = 10, .cell_height = 20 };
+    const emulator: *Emulator = try .create(io, gpa, size);
+    defer emulator.destroy();
+    const app = try gpa.create(App);
+    defer gpa.destroy(app);
+    var options: Options = .{ .path = dir_path, .page = 2, .dark = false, .watch = true, .medium = .direct };
+    {
+        app.init(io, gpa, options, size, null);
+        defer app.deinit();
+        try app.settle(&emulator.output);
+        try std.testing.expectEqual(error.NoUsableFile, app.open_error.?);
+    }
+
+    const pages = @embedFile("../document/testdata/two-pages.pnm");
+    try tmp.dir.writeFile(io, .{ .sub_path = "scan2", .data = pages });
+    try tmp.dir.writeFile(io, .{ .sub_path = "scan10.pnm", .data = pages });
+    {
+        app.init(io, gpa, options, size, null);
+        defer app.deinit();
+        try app.settle(&emulator.output);
+        try std.testing.expectEqual(null, app.open_error);
+        try std.testing.expectEqualStrings("scan2", app.frame.status().left);
+        try std.testing.expectEqual(1, app.state.anchor.page);
+        const first_path = app.path;
+        try std.testing.expect(!app.input("i+L"));
+        try app.settle(&emulator.output);
+        try std.testing.expectEqualStrings("scan10.pnm", app.frame.status().left);
+        try std.testing.expectEqual(0, app.state.anchor.page);
+        try std.testing.expectEqual(1, app.state.zoom);
+        try std.testing.expect(app.state.dark);
+
+        try std.testing.expect(!app.input("HLlL"));
+        try app.settle(&emulator.output);
+        try std.testing.expectEqualStrings("No next file", app.frame.status().left);
+        try std.testing.expectEqual(1, app.state.anchor.page);
+        const generation = app.state.document.generation;
+        app.renderer.reloadWatched(first_path);
+        try app.settle(&emulator.output);
+        try std.testing.expectEqual(generation, app.state.document.generation);
+
+        try tmp.dir.writeFile(io, .{ .sub_path = "scan10.pnm", .data = @embedFile("../document/testdata/red-square.png") });
+        try std.testing.expect(!app.input(":reload\r"));
+        try app.settle(&emulator.output);
+        try std.testing.expectEqual(1, app.page_sizes.len);
+    }
+
+    const file_path = try tmp.dir.realPathFileAlloc(io, "scan10.pnm", gpa);
+    defer gpa.free(file_path);
+    options.path = file_path;
+    app.init(io, gpa, options, size, null);
+    defer app.deinit();
+    try app.settle(&emulator.output);
+    try std.testing.expect(!app.input("H"));
+    try app.settle(&emulator.output);
+    try std.testing.expectEqualStrings("scan2", app.frame.status().left);
+    try std.testing.expectEqual(0, app.state.anchor.page);
 }
 
 test "a change reloads once it has held for a check, and only once" {
@@ -1181,8 +1320,8 @@ test "an empty file stays open and reloads when PDF content arrives" {
         .medium = .shared_memory,
     }, size, null);
     defer app.deinit();
-    var watch: Watch = .init(io, path);
     try app.settle(&emulator.output);
+    var watch: Watch = .init(io, path, app.file_stamp);
     try std.testing.expectEqual(null, app.open_error);
     try std.testing.expectEqualStrings("no pages", app.frame.status().right);
     try std.testing.expectEqual(0, app.frame.slices().len);

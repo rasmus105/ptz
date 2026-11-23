@@ -13,13 +13,13 @@ const argparse = @import("argparse.zig");
 pub const Protocol = enum { auto, kitty };
 
 pub const Options = struct {
-    file: []const u8,
+    path: []const u8 = ".",
     page: u32 = 1,
     dark: bool = false,
     watch: bool = true,
     protocol: Protocol = .auto,
 
-    pub const positional = .{ .file = "Document or image file to open" };
+    pub const positional = .{ .path = "File or directory to open" };
     pub const shorts = .{ .page = 'p', .dark = 'd' };
     pub const help = .{
         .page = "Open at page N",
@@ -33,7 +33,7 @@ const Cli = argparse.Cli(Options, .{
     .name = "ptz",
     .summary = "Render documents and images in the terminal",
     .version = build_options.version,
-    .examples = &.{ "ptz paper.pdf", "ptz -p 3 thesis.pdf" },
+    .examples = &.{ "ptz", "ptz scans/", "ptz -p 3 thesis.pdf" },
 });
 
 // ====================================================================================================

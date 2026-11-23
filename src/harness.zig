@@ -460,7 +460,9 @@ fn fuzzCheck(io: std.Io, gpa: std.mem.Allocator, emulator: *Emulator, viewer: *a
     defer fresh_emulator.destroy();
     const fresh = try gpa.create(app.App);
     defer gpa.destroy(fresh);
-    fresh.init(io, gpa, app_options, state.size, null);
+    var fresh_options = app_options;
+    fresh_options.path = viewer.path;
+    fresh.init(io, gpa, fresh_options, state.size, null);
     defer fresh.deinit();
     try settle(io, fresh, fresh_emulator, 5000);
     const document = fresh.state.document;

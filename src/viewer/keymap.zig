@@ -29,6 +29,8 @@ pub const Action = union(enum) {
     pan_lines: i32,
     /// Move this many pages; negative is back.
     move_pages: i32,
+    /// Move this many files; negative is back.
+    move_files: i32,
     /// Go to this page, counting from 1.
     goto_page: u32,
     goto_last_page,
@@ -79,6 +81,8 @@ pub const KeyMap = struct {
                 'k' => .{ .scroll_lines = -n },
                 'l' => .{ .move_pages = n },
                 'h' => .{ .move_pages = -n },
+                'L' => .{ .move_files = n },
+                'H' => .{ .move_files = -n },
                 ' ' => .{ .scroll_screens = n },
                 'G' => if (count) |page| .{ .goto_page = page } else .goto_last_page,
                 '+' => .{ .zoom_steps = n },

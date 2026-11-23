@@ -15,6 +15,7 @@ const document = @import("../document/main.zig");
 const viewer = @import("../viewer/main.zig");
 
 // local
+const Directory = @import("Directory.zig");
 const Search = @import("Search.zig");
 
 // aliases
@@ -26,10 +27,20 @@ const search = viewer.search;
 // Types
 // ====================================================================================================
 
+pub const OpenError = document.Error || error{ CannotReadDirectory, NoUsableFile };
+
 pub const Result = union(enum) {
     /// The document was (re)loaded; owns the slices. See `viewer.Document`.
-    opened: struct { generation: u32, page_sizes: []document.Size, page_offsets: []f64 },
-    open_failed: document.Error,
+    opened: struct {
+        path: []const u8,
+        stat: ?std.Io.File.Stat,
+        moved: bool,
+        generation: u32,
+        page_sizes: []document.Size,
+        page_offsets: []f64,
+    },
+    open_failed: OpenError,
+    browse_failed: []const u8,
     links: struct { view: viewer.LinkResult, arena: std.heap.ArenaAllocator },
     search: struct { page: ?search.Page = null, navigation: ?search.Navigation = null },
     tile: struct { tile: Tile, encoded: graphics.Encoded },
@@ -44,7 +55,7 @@ pub const Result = union(enum) {
             .tile => |tile| tile.encoded.deinit(gpa),
             .links => |links| links.arena.deinit(),
             .search => |found| if (found.page) |page| gpa.free(page.parts),
-            .open_failed, .render_failed => {},
+            .open_failed, .browse_failed, .render_failed => {},
         }
     }
 };
@@ -55,7 +66,6 @@ pub const Result = union(enum) {
 
 io: std.Io,
 gpa: std.mem.Allocator,
-path: []const u8,
 medium: graphics.Medium,
 wake_fd: ?std.posix.fd_t,
 thread: ?std.Thread,
@@ -66,6 +76,8 @@ mutex: std.Io.Mutex,
 condition: std.Io.Condition,
 // Guarded by `mutex`:
 reload_requested: bool,
+reload_path: ?[]const u8 = null,
+file_move: ?i32 = null,
 /// A reload or lookup is running without the mutex held.
 loading: bool,
 link_request: ?viewer.LinkRequest,
@@ -82,6 +94,8 @@ results: std.ArrayList(Result),
 stopping: bool,
 
 // Only used by whoever runs `step`:
+path: []const u8,
+directory: ?Directory = null,
 doc: ?document.Document,
 /// Counts successful loads; tiles of any other generation are skipped.
 generation: u32,
@@ -141,6 +155,7 @@ pub fn deinit(renderer: *Renderer) void {
         thread.join();
     }
     if (renderer.doc) |*doc| doc.close();
+    if (renderer.directory) |*directory| directory.deinit();
     renderer.gpa.free(renderer.search_empty_pages);
     for (renderer.results.items) |result| result.deinit(renderer.gpa);
     renderer.results.deinit(renderer.gpa);
@@ -158,6 +173,25 @@ pub fn reload(renderer: *Renderer) void {
     renderer.mutex.lockUncancelable(renderer.io);
     defer renderer.mutex.unlock(renderer.io);
     renderer.reload_requested = true;
+    renderer.reload_path = null;
+    renderer.condition.signal(renderer.io);
+}
+
+/// Ignore a watch notification if the worker has since moved to another file.
+pub fn reloadWatched(renderer: *Renderer, path: []const u8) void {
+    renderer.mutex.lockUncancelable(renderer.io);
+    defer renderer.mutex.unlock(renderer.io);
+    if (renderer.reload_requested) return;
+    renderer.reload_requested = true;
+    renderer.reload_path = path;
+    renderer.condition.signal(renderer.io);
+}
+
+pub fn moveFiles(renderer: *Renderer, count: i32) void {
+    renderer.mutex.lockUncancelable(renderer.io);
+    defer renderer.mutex.unlock(renderer.io);
+    std.debug.assert(renderer.file_move == null);
+    renderer.file_move = count;
     renderer.condition.signal(renderer.io);
 }
 
@@ -224,7 +258,7 @@ pub fn want(renderer: *Renderer, tiles: []const Tile, visible_len: usize) void {
         for (renderer.results.items) |result| switch (result) {
             .tile => |done| if (std.meta.eql(done.tile, tile)) continue :next,
             .render_failed => |failed| if (std.meta.eql(failed, tile)) continue :next,
-            .opened, .open_failed, .links, .search => {},
+            .opened, .open_failed, .browse_failed, .links, .search => {},
         };
         renderer.wanted[renderer.wanted_len] = tile;
         renderer.wanted_len += 1;
@@ -250,7 +284,7 @@ pub fn collect(renderer: *Renderer, results: *std.ArrayList(Result)) std.mem.All
 pub fn idle(renderer: *Renderer) bool {
     renderer.mutex.lockUncancelable(renderer.io);
     defer renderer.mutex.unlock(renderer.io);
-    return !renderer.reload_requested and !renderer.loading and
+    return !renderer.reload_requested and renderer.file_move == null and !renderer.loading and
         renderer.link_request == null and renderer.wanted_len == 0 and
         renderer.search_scan == null and renderer.search_viewport == null and
         renderer.rendering == null and renderer.results.items.len == 0;
@@ -266,11 +300,15 @@ pub fn step(renderer: *Renderer) bool {
         renderer.mutex.unlock(renderer.io);
         return false;
     };
-    const reload_requested = renderer.reload_requested;
+    const reload_requested = renderer.reload_requested and
+        (renderer.reload_path == null or std.mem.eql(u8, renderer.path, renderer.reload_path.?));
     renderer.reload_requested = false;
-    const link_request = if (reload_requested) null else renderer.link_request;
+    const file_move = if (reload_requested) null else renderer.file_move;
+    if (file_move != null) renderer.file_move = null;
+    const opening = reload_requested or file_move != null;
+    const link_request = if (opening) null else renderer.link_request;
     if (link_request != null) renderer.link_request = null;
-    const can_search = !reload_requested and link_request == null and renderer.wanted_visible_len == 0;
+    const can_search = !opening and link_request == null and renderer.wanted_visible_len == 0;
     var scan = if (can_search) renderer.search_scan else null;
     var query: ?search.Query = null;
     var page: u32 = 0;
@@ -287,7 +325,7 @@ pub fn step(renderer: *Renderer) bool {
         }
     }
     if (query) |current| renderer.searching_page = .{ .id = current.id, .page = page };
-    renderer.loading = reload_requested or link_request != null or query != null;
+    renderer.loading = opening or link_request != null or query != null;
     if (!renderer.loading and renderer.wanted_len > 0) {
         renderer.rendering = renderer.wanted[0];
         std.mem.copyForwards(Tile, renderer.wanted[0 .. renderer.wanted_len - 1], renderer.wanted[1..renderer.wanted_len]);
@@ -297,8 +335,10 @@ pub fn step(renderer: *Renderer) bool {
     const tile = renderer.rendering;
     renderer.mutex.unlock(renderer.io);
 
-    const result = if (reload_requested)
+    const result: ?Result = if (reload_requested)
         renderer.load()
+    else if (file_move) |count|
+        if (renderer.doc != null) renderer.browse(count) else .{ .browse_failed = "No document to switch from" }
     else if (link_request) |request|
         renderer.readLinks(request)
     else if (query) |current|
@@ -336,7 +376,7 @@ pub fn step(renderer: *Renderer) bool {
 fn run(renderer: *Renderer) void {
     while (true) {
         renderer.mutex.lockUncancelable(renderer.io);
-        while (!renderer.stopping and !renderer.reload_requested and renderer.link_request == null and renderer.wanted_len == 0 and
+        while (!renderer.stopping and !renderer.reload_requested and renderer.file_move == null and renderer.link_request == null and renderer.wanted_len == 0 and
             renderer.search_scan == null and renderer.search_viewport == null)
         {
             renderer.condition.waitUncancelable(renderer.io, &renderer.mutex);
@@ -417,20 +457,72 @@ fn readMatches(renderer: *Renderer, query: search.Query, page: u32, scan: ?*Sear
     return result;
 }
 
-fn load(renderer: *Renderer) Result {
+fn load(renderer: *Renderer) ?Result {
+    if (renderer.doc == null) {
+        const stat = std.Io.Dir.cwd().statFile(renderer.io, renderer.path, .{}) catch null;
+        if (stat != null and stat.?.kind == .directory) return renderer.browse(1);
+    }
     const mode: document.Document.OpenMode = if (renderer.doc == null) .initial else .replacement;
-    var doc = document.Document.openSnapshot(renderer.io, renderer.gpa, renderer.path, mode) catch |err|
+    const doc = document.Document.openSnapshot(renderer.io, renderer.gpa, renderer.path, mode) catch |err|
         return .{ .open_failed = err };
+    return renderer.install(renderer.path, doc, false) catch |err| .{ .open_failed = err };
+}
+
+fn browse(renderer: *Renderer, count: i32) ?Result {
+    const initial = renderer.doc == null;
+    if (renderer.directory == null) {
+        const parent = if (initial) renderer.path else std.fs.path.dirname(renderer.path) orelse ".";
+        renderer.directory = Directory.read(renderer.io, renderer.gpa, parent) catch |err| return if (initial)
+            .{ .open_failed = err }
+        else
+            .{ .browse_failed = if (err == error.OutOfMemory) "Out of memory" else "Could not read directory" };
+    }
+    const directory = renderer.directory.?;
+    const forward = count > 0;
+    const candidates = if (initial) directory.paths else directory.neighbors(renderer.io, renderer.path, forward);
+    var remaining = @abs(count);
+    var selected: ?document.Document = null;
+    defer if (selected) |*doc| doc.close();
+    var path: []const u8 = undefined;
+    for (0..candidates.len) |i| {
+        renderer.mutex.lockUncancelable(renderer.io);
+        const stopping = renderer.stopping;
+        renderer.mutex.unlock(renderer.io);
+        if (stopping) return null;
+
+        const candidate = candidates[if (forward) i else candidates.len - 1 - i];
+        const doc = document.Document.openSnapshot(renderer.io, renderer.gpa, candidate, .browse) catch |err| {
+            if (err == error.OutOfMemory) return if (initial)
+                .{ .open_failed = err }
+            else
+                .{ .browse_failed = "Out of memory" };
+            continue;
+        };
+        if (selected) |*previous| previous.close();
+        selected = doc;
+        path = candidate;
+        remaining -= 1;
+        if (remaining == 0) break;
+    }
+    const doc = selected orelse return if (initial)
+        .{ .open_failed = error.NoUsableFile }
+    else
+        .{ .browse_failed = if (forward) "No next file" else "No previous file" };
+    selected = null;
+    return renderer.install(path, doc, !initial) catch |err| if (initial)
+        .{ .open_failed = err }
+    else
+        .{ .browse_failed = "Out of memory" };
+}
+
+/// Takes ownership even when allocating the page layout fails.
+fn install(renderer: *Renderer, path: []const u8, snapshot: document.Document, moved: bool) std.mem.Allocator.Error!Result {
+    var doc = snapshot;
+    errdefer doc.close();
     const page_count = doc.pageCount();
-    const page_sizes = renderer.gpa.alloc(document.Size, page_count) catch {
-        doc.close();
-        return .{ .open_failed = error.OutOfMemory };
-    };
-    const page_offsets = renderer.gpa.alloc(f64, page_count) catch {
-        renderer.gpa.free(page_sizes);
-        doc.close();
-        return .{ .open_failed = error.OutOfMemory };
-    };
+    const page_sizes = try renderer.gpa.alloc(document.Size, page_count);
+    errdefer renderer.gpa.free(page_sizes);
+    const page_offsets = try renderer.gpa.alloc(f64, page_count);
     var offset: f64 = 0;
     for (page_sizes, page_offsets, 0..) |*size, *page_offset, page| {
         size.* = doc.pageSize(@intCast(page)) catch .{ .width = document.page_size_min, .height = document.page_size_min };
@@ -439,8 +531,16 @@ fn load(renderer: *Renderer) Result {
     }
     if (renderer.doc) |*old| old.close();
     renderer.doc = doc;
+    renderer.path = path;
     renderer.generation += 1;
-    return .{ .opened = .{ .generation = renderer.generation, .page_sizes = page_sizes, .page_offsets = page_offsets } };
+    return .{ .opened = .{
+        .path = path,
+        .stat = doc.stat,
+        .moved = moved,
+        .generation = renderer.generation,
+        .page_sizes = page_sizes,
+        .page_offsets = page_offsets,
+    } };
 }
 
 fn readLinks(renderer: *Renderer, request: viewer.LinkRequest) ?Result {
